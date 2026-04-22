@@ -3,6 +3,7 @@
 # Dashboard Streamlit — Operación UBER 2025 / 2026
 # Usa business_rules.py para cargar y transformar datos.
 # ──────────────────────────────────────────────────────────────
+import os
 import re
 import numpy as np
 import pandas as pd
@@ -16,7 +17,11 @@ from business_rules import (
     add_yearweek,
     yearweek_label,
     get_analisis_inversiones,
+    get_gastos,
+    get_inversiones_egreso,
+    conductores_por_semana,
     PAGO_SEMANAL_DEFAULT,
+    CONCEPTOS_INVERSION,
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -288,19 +293,30 @@ def _generar_excel_amortizacion(
 # ═══════════════════════════════════════════════════════════════
 # SIDEBAR: CARGA DE DATOS
 # ═══════════════════════════════════════════════════════════════
+# Detectar si existe el archivo local (solo disponible en desarrollo)
+_DEFAULT_FILE = "prueba.xlsx"
+_local_file_exists = os.path.isfile(_DEFAULT_FILE)
+
 with st.sidebar:
     st.markdown("## 📥 Datos")
     uploaded = st.file_uploader("Sube tu Excel", type=["xlsx", "xls"])
-    default_path = "prueba.xlsx"
-    use_default = st.checkbox(
-        "Usar archivo local (prueba.xlsx)",
-        value=(uploaded is None),
-    )
 
-path = uploaded if uploaded is not None else (default_path if use_default else None)
+    if _local_file_exists:
+        # Entorno de desarrollo: ofrecer archivo local como alternativa
+        use_default = st.checkbox(
+            "Usar archivo local (prueba.xlsx)",
+            value=(uploaded is None),
+        )
+    else:
+        # Producción (Render): solo upload — no hay archivo local
+        use_default = False
+        if uploaded is None:
+            st.info("📂 Sube tu archivo Excel para comenzar.")
+
+path = uploaded if uploaded is not None else (_DEFAULT_FILE if use_default else None)
 
 if path is None:
-    st.warning("Sube un archivo Excel o activa el archivo local.")
+    st.warning("Sube un archivo Excel para visualizar los datos.")
     st.stop()
 
 
@@ -408,6 +424,18 @@ with st.sidebar:
         cond_sel = st.multiselect("Conductor", options=conductores_f, default=conductores_f)
         if cond_sel:
             df_ing = df_ing[df_ing["conductor"].astype(str).isin(cond_sel)]
+
+
+# ═══════════════════════════════════════════════════════════════
+# SEPARACIÓN INVERSIÓN / GASTO OPERATIVO
+# ──────────────────────────────────────────────────────────────
+# df_gasto        → egresos sin INVERSIÓN ni PAGO DE SUBASTA
+#                   (usar en KPIs de gasto, gráficas operativas, utilidad)
+# df_inversion_egr→ solo egresos de tipo inversión
+#                   (mostrar como KPI separado; NO resta la utilidad operativa)
+# ═══════════════════════════════════════════════════════════════
+df_gasto         = get_gastos(df_egr)
+df_inversion_egr = get_inversiones_egreso(df_egr)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -540,6 +568,43 @@ with tab_ingresos:
             fig5.update_layout(xaxis_title="Semana", yaxis_title="Fianza Neta ($)")
             st.plotly_chart(styled_bar(fig5), use_container_width=True)
 
+        # ── Conductores únicos por semana ─────────────────────────────────
+        st.markdown("#### 👷 Conductores Únicos por Semana")
+        st.caption(
+            "Cada conductor se cuenta **una sola vez por semana**, "
+            "eliminando duplicados del Excel antes de agregar."
+        )
+        cond_sem_df = conductores_por_semana(df_ing)
+        if len(cond_sem_df) > 0:
+            fig_cond = px.bar(
+                cond_sem_df,
+                x="WEEK_LABEL",
+                y="n_conductores",
+                color_discrete_sequence=["#a78bfa"],
+                text="n_conductores",
+            )
+            fig_cond.update_traces(
+                textposition="outside",
+                hovertemplate="Semana: %{x}<br>Conductores: %{y}<extra></extra>",
+            )
+            fig_cond.update_layout(
+                xaxis_title="Semana",
+                yaxis_title="Conductores únicos",
+                yaxis=dict(tickformat="d"),
+            )
+            st.plotly_chart(styled_bar(fig_cond, money_axis=None), use_container_width=True)
+
+            # KPI rápido debajo de la gráfica
+            prom_cond = cond_sem_df["n_conductores"].mean()
+            max_cond  = cond_sem_df["n_conductores"].max()
+            min_cond  = cond_sem_df["n_conductores"].min()
+            kc1, kc2, kc3 = st.columns(3)
+            kc1.metric("Prom. Conductores / Semana", f"{prom_cond:.1f}")
+            kc2.metric("Máx. Conductores en una Semana", f"{int(max_cond)}")
+            kc3.metric("Mín. Conductores en una Semana", f"{int(min_cond)}")
+        else:
+            st.info("No hay datos suficientes para graficar conductores por semana.")
+
         # Tabla detalle
         st.markdown("#### 📋 Tabla de Detalle — Ingresos")
         cols_show = [
@@ -574,32 +639,46 @@ with tab_egresos:
     if len(df_egr) == 0:
         st.info("No hay datos de egresos con los filtros actuales.")
     else:
-        # KPIs
-        total_gasto = df_egr["monto_real"].sum()
-        n_semanas_egr = df_egr["YEARWEEK"].nunique()
-        prom_semanal = total_gasto / max(n_semanas_egr, 1)
-        top_concepto = (
-            df_egr.groupby("concepto", as_index=False)["monto_real"].sum()
-            .sort_values("monto_real", ascending=False)
-            .iloc[0] if "concepto" in df_egr.columns and len(df_egr) > 0 else None
-        )
+        # ── KPIs de Gasto Operativo (excluye INVERSIÓN) ──────────────────
+        total_gasto_op   = df_gasto["monto_real"].sum() if len(df_gasto) > 0 else 0.0
+        total_inversion  = df_inversion_egr["monto_real"].sum() if len(df_inversion_egr) > 0 else 0.0
+        n_semanas_egr    = df_gasto["YEARWEEK"].nunique() if len(df_gasto) > 0 else 0
+        prom_semanal_op  = total_gasto_op / max(n_semanas_egr, 1)
+        top_concepto = None
+        if "concepto" in df_gasto.columns and len(df_gasto) > 0:
+            top_concepto = (
+                df_gasto.groupby("concepto", as_index=False)["monto_real"].sum()
+                .sort_values("monto_real", ascending=False)
+                .iloc[0]
+            )
 
+        st.markdown("##### 💡 Gasto Operativo *(INVERSIÓN excluida)*")
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Gasto Total", f"${total_gasto:,.0f}")
-        k2.metric("Promedio Semanal", f"${prom_semanal:,.0f}")
+        k1.metric("Gasto Operativo Total", f"${total_gasto_op:,.0f}")
+        k2.metric("Promedio Semanal", f"${prom_semanal_op:,.0f}")
         k3.metric("Semanas", f"{n_semanas_egr}")
         if top_concepto is not None:
             k4.metric(f"Top: {top_concepto['concepto']}", f"${top_concepto['monto_real']:,.0f}")
+
+        # KPI de inversión al lado, diferenciado
+        st.markdown("##### 🏦 Inversión *(separada del gasto operativo)*")
+        ki_col, ki_blank1, ki_blank2, ki_blank3 = st.columns(4)
+        ki_col.metric(
+            "💰 Inversión Total",
+            f"${total_inversion:,.0f}",
+            delta="No resta la utilidad operativa",
+            delta_color="off",
+        )
 
         st.divider()
 
         c1, c2 = st.columns(2)
 
         with c1:
-            st.markdown("#### Gasto por Concepto (General)")
-            if "concepto" in df_egr.columns:
+            st.markdown("#### Gasto por Concepto — Operativo *(sin Inversión)*")
+            if "concepto" in df_gasto.columns and len(df_gasto) > 0:
                 by_conc = (
-                    df_egr.groupby("concepto", as_index=False)["monto_real"]
+                    df_gasto.groupby("concepto", as_index=False)["monto_real"]
                     .sum()
                     .sort_values("monto_real", ascending=True)
                     .tail(15)
@@ -615,29 +694,34 @@ with tab_egresos:
                 )
                 fig.update_layout(xaxis_title="Gasto ($)", yaxis_title="")
                 st.plotly_chart(styled_bar(fig, money_axis="x"), use_container_width=True)
+            else:
+                st.info("Sin datos de gasto operativo.")
 
         with c2:
-            st.markdown("#### Gasto Semanal")
-            g_egr = (
-                df_egr.groupby("WEEK_LABEL", as_index=False)["monto_real"]
-                .sum()
-                .sort_values("WEEK_LABEL")
-            )
-            fig2 = px.line(
-                g_egr, x="WEEK_LABEL", y="monto_real",
-                markers=True,
-                color_discrete_sequence=[COLOR_EGRESOS],
-            )
-            fig2.update_traces(hovertemplate="Semana: %{x}<br>Gasto: $%{y:,.0f}<extra></extra>")
-            fig2.update_layout(xaxis_title="Semana", yaxis_title="Gasto ($)")
-            st.plotly_chart(styled_line(fig2), use_container_width=True)
+            st.markdown("#### Gasto Semanal — Operativo *(sin Inversión)*")
+            if len(df_gasto) > 0:
+                g_egr = (
+                    df_gasto.groupby("WEEK_LABEL", as_index=False)["monto_real"]
+                    .sum()
+                    .sort_values("WEEK_LABEL")
+                )
+                fig2 = px.line(
+                    g_egr, x="WEEK_LABEL", y="monto_real",
+                    markers=True,
+                    color_discrete_sequence=[COLOR_EGRESOS],
+                )
+                fig2.update_traces(hovertemplate="Semana: %{x}<br>Gasto: $%{y:,.0f}<extra></extra>")
+                fig2.update_layout(xaxis_title="Semana", yaxis_title="Gasto ($)")
+                st.plotly_chart(styled_line(fig2), use_container_width=True)
+            else:
+                st.info("Sin datos de gasto semanal.")
 
-        # Detalle por tipo
-        if "detalle" in df_egr.columns:
-            st.markdown("#### Gasto por Detalle (Particular)")
+        # Detalle por tipo (solo gasto operativo)
+        if "detalle" in df_gasto.columns and len(df_gasto) > 0:
+            st.markdown("#### Gasto por Detalle — Operativo")
             ver_todo_det = st.checkbox("Ver todos los detalles", value=False, key="det_all")
             by_det = (
-                df_egr.groupby("detalle", as_index=False)["monto_real"]
+                df_gasto.groupby("detalle", as_index=False)["monto_real"]
                 .sum()
                 .sort_values("monto_real", ascending=False)
             )
@@ -653,24 +737,56 @@ with tab_egresos:
             fig3.update_layout(xaxis_title="Detalle", yaxis_title="Gasto ($)")
             st.plotly_chart(styled_bar(fig3), use_container_width=True)
 
-        # Tabla detalle
-        st.markdown("#### 📋 Tabla de Detalle — Egresos")
+        # Tabla detalle — Gasto Operativo
+        st.markdown("#### 📋 Tabla de Detalle — Gasto Operativo *(sin Inversión)*")
         cols_egr = [
             c for c in [
                 "año", "semana", "WEEK_LABEL", "concepto", "detalle",
                 "conductor", "llave", "socio", "metodo_pago",
                 "monto_real", "comercio",
-            ] if c in df_egr.columns
+            ] if c in df_gasto.columns
         ]
-        st.dataframe(
-            df_egr[cols_egr].sort_values(["año", "semana"], ascending=[True, True]),
-            use_container_width=True,
-            hide_index=True,
-            height=400,
-            column_config={
-                "monto_real": st.column_config.NumberColumn("Monto Real", format="$%,.0f"),
-            },
+        if len(df_gasto) > 0:
+            st.dataframe(
+                df_gasto[cols_egr].sort_values(["año", "semana"], ascending=[True, True]),
+                use_container_width=True,
+                hide_index=True,
+                height=400,
+                column_config={
+                    "monto_real": st.column_config.NumberColumn("Monto Real", format="$%,.0f"),
+                },
+            )
+
+        # ── Sección Inversión ─────────────────────────────────────────────
+        st.divider()
+        st.markdown("#### 🏦 Movimientos de Inversión")
+        st.caption(
+            f"Conceptos clasificados como inversión: "
+            f"**{', '.join(CONCEPTOS_INVERSION)}** — "
+            f"estos montos aparecen aquí y **no se suman al gasto operativo**."
         )
+        if len(df_inversion_egr) > 0:
+            cols_inv = [
+                c for c in [
+                    "año", "semana", "WEEK_LABEL", "concepto", "detalle",
+                    "conductor", "llave", "socio", "monto_real", "comercio",
+                ] if c in df_inversion_egr.columns
+            ]
+            st.dataframe(
+                df_inversion_egr[cols_inv].sort_values(["año", "semana"], ascending=[True, True]),
+                use_container_width=True,
+                hide_index=True,
+                height=300,
+                column_config={
+                    "monto_real": st.column_config.NumberColumn("Monto Inversión", format="$%,.0f"),
+                },
+            )
+        else:
+            st.info(
+                "No se encontraron movimientos de inversión en el período seleccionado. "
+                f"Conceptos que se clasifican como inversión: {', '.join(CONCEPTOS_INVERSION)}"
+            )
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -679,17 +795,26 @@ with tab_egresos:
 with tab_resumen:
     st.subheader("📊 Resumen Global — Ingresos vs Egresos")
 
-    total_ing = df_ing["ganancias_totales"].sum() if len(df_ing) > 0 else 0
-    total_egr = df_egr["monto_real"].sum() if len(df_egr) > 0 else 0
-    utilidad = total_ing - total_egr
+    total_ing        = df_ing["ganancias_totales"].sum() if len(df_ing) > 0 else 0.0
+    # Utilidad operativa: solo gasto operativo (SIN INVERSIÓN)
+    total_egr_op     = df_gasto["monto_real"].sum() if len(df_gasto) > 0 else 0.0
+    total_inv_global = df_inversion_egr["monto_real"].sum() if len(df_inversion_egr) > 0 else 0.0
+    utilidad         = total_ing - total_egr_op   # operativa, sin descontar inversión
 
-    k1, k2, k3 = st.columns(3)
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("Ingresos Totales", f"${total_ing:,.0f}")
-    k2.metric("Egresos Totales", f"${total_egr:,.0f}")
+    k2.metric("Gasto Operativo", f"${total_egr_op:,.0f}", help="Excluye INVERSIÓN y PAGO DE SUBASTA")
     k3.metric(
-        "Utilidad Neta",
+        "Utilidad Operativa",
         f"${utilidad:,.0f}",
         delta=f"{'✅' if utilidad >= 0 else '⚠️'} {'Positiva' if utilidad >= 0 else 'Negativa'}",
+    )
+    k4.metric(
+        "🏦 Inversión",
+        f"${total_inv_global:,.0f}",
+        delta="No resta la utilidad",
+        delta_color="off",
+        help="INVERSIÓN + PAGO DE SUBASTA — separados del gasto operativo",
     )
 
     st.divider()
@@ -697,7 +822,8 @@ with tab_resumen:
     c1, c2 = st.columns(2)
 
     with c1:
-        st.markdown("#### Ingreso vs Egreso por Semana")
+        st.markdown("#### Ingreso vs Gasto Operativo por Semana")
+        st.caption("Los Egresos aquí representan **solo gasto operativo** (sin Inversión)")
 
         # Agrupar ingresos por semana
         if len(df_ing) > 0:
@@ -709,9 +835,10 @@ with tab_resumen:
         else:
             gi = pd.DataFrame(columns=["YEARWEEK", "WEEK_LABEL", "Ingresos"])
 
-        if len(df_egr) > 0:
+        # Agrupar gasto operativo por semana (sin inversión)
+        if len(df_gasto) > 0:
             ge = (
-                df_egr.groupby(["YEARWEEK", "WEEK_LABEL"], as_index=False)["monto_real"]
+                df_gasto.groupby(["YEARWEEK", "WEEK_LABEL"], as_index=False)["monto_real"]
                 .sum()
                 .rename(columns={"monto_real": "Egresos"})
             )
@@ -738,10 +865,11 @@ with tab_resumen:
             st.plotly_chart(styled_bar(fig), use_container_width=True)
 
     with c2:
-        st.markdown("#### Distribución de Egresos por Concepto")
-        if len(df_egr) > 0 and "concepto" in df_egr.columns:
+        st.markdown("#### Distribución de Gasto Operativo por Concepto")
+        st.caption("Solo gasto operativo — Inversión excluida")
+        if len(df_gasto) > 0 and "concepto" in df_gasto.columns:
             conc_egr = (
-                df_egr.groupby("concepto", as_index=False)["monto_real"]
+                df_gasto.groupby("concepto", as_index=False)["monto_real"]
                 .sum()
                 .sort_values("monto_real", ascending=False)
             )
@@ -758,7 +886,7 @@ with tab_resumen:
             st.plotly_chart(fig2, use_container_width=True)
 
     # Utilidad por semana
-    st.markdown("#### Utilidad Neta por Semana")
+    st.markdown("#### Utilidad Operativa por Semana *(Ingreso − Gasto Operativo)*")
     if len(merged) > 0:
         merged["Utilidad"] = merged["Ingresos"] - merged["Egresos"]
         colors = [COLOR_INGRESOS if v >= 0 else COLOR_EGRESOS for v in merged["Utilidad"]]
@@ -776,7 +904,7 @@ with tab_resumen:
         st.plotly_chart(styled_bar(fig3), use_container_width=True)
 
     # Tabla resumen por semana
-    st.markdown("#### 📋 Resumen por Semana")
+    st.markdown("#### 📋 Resumen por Semana *(Gasto = solo operativo)*")
     if len(merged) > 0:
         merged_show = merged[["WEEK_LABEL", "Ingresos", "Egresos", "Utilidad"]].copy()
         merged_show = merged_show.sort_values("WEEK_LABEL")
@@ -788,7 +916,7 @@ with tab_resumen:
             column_config={
                 "WEEK_LABEL": st.column_config.TextColumn("Semana"),
                 "Ingresos": st.column_config.NumberColumn(format="$%,.0f"),
-                "Egresos": st.column_config.NumberColumn(format="$%,.0f"),
+                "Egresos": st.column_config.NumberColumn("Gasto Operativo", format="$%,.0f"),
                 "Utilidad": st.column_config.NumberColumn(format="$%,.0f"),
             },
         )
@@ -818,11 +946,11 @@ with tab_vehiculos:
             )
         )
 
-        # Agrupar egresos por vehículo (toda la flota)
+        # Agrupar gasto operativo por vehículo (SIN inversión)
         fleet_egr = pd.DataFrame(columns=["llave", "Egresos"])
-        if len(df_egr) > 0 and "llave" in df_egr.columns:
+        if len(df_gasto) > 0 and "llave" in df_gasto.columns:
             fleet_egr = (
-                df_egr[df_egr["llave"].astype(str).isin(llaves_all)]
+                df_gasto[df_gasto["llave"].astype(str).isin(llaves_all)]
                 .groupby("llave", as_index=False)["monto_real"]
                 .sum()
                 .rename(columns={"monto_real": "Egresos"})
@@ -848,9 +976,9 @@ with tab_vehiculos:
         f1, f2, f3, f4 = st.columns(4)
         f1.metric("🚗 Vehículos Activos", f"{n_vehiculos}")
         f2.metric("💰 Ingresos Flota", f"${total_fleet_ing:,.0f}")
-        f3.metric("💸 Egresos Flota", f"${total_fleet_egr:,.0f}")
+        f3.metric("💸 Gasto Op. Flota", f"${total_fleet_egr:,.0f}", help="Sin Inversión")
         f4.metric(
-            "📈 Utilidad Neta Flota",
+            "📈 Utilidad Operativa Flota",
             f"${total_fleet_util:,.0f}",
             delta=f"{'✅' if total_fleet_util >= 0 else '⚠️'} Margen {margen_pct:.1f}%",
         )
@@ -931,10 +1059,10 @@ with tab_vehiculos:
                 .sort_values("Ganancias", ascending=False)
             )
 
-            # Agregar egresos por vehículo si existen
-            if len(df_egr) > 0 and "llave" in df_egr.columns:
+            # Agregar gasto operativo por vehículo (SIN inversión)
+            if len(df_gasto) > 0 and "llave" in df_gasto.columns:
                 egr_v = (
-                    df_egr[df_egr["llave"].astype(str).isin(llave_sel)]
+                    df_gasto[df_gasto["llave"].astype(str).isin(llave_sel)]
                     .groupby("llave", as_index=False)["monto_real"]
                     .sum()
                     .rename(columns={"monto_real": "Egresos"})
@@ -957,9 +1085,9 @@ with tab_vehiculos:
             v1, v2, v3, v4 = st.columns(4)
             v1.metric("💰 Renta Total", f"${sel_renta:,.0f}")
             v2.metric("📈 Ganancias Totales", f"${sel_ganancias:,.0f}")
-            v3.metric("💸 Egresos", f"${sel_egresos:,.0f}")
+            v3.metric("💸 Gasto Operativo", f"${sel_egresos:,.0f}", help="Sin Inversión")
             v4.metric(
-                "📊 Utilidad Neta",
+                "📊 Utilidad Operativa",
                 f"${sel_utilidad:,.0f}",
                 delta=f"{'✅ Positiva' if sel_utilidad >= 0 else '⚠️ Negativa'}",
             )

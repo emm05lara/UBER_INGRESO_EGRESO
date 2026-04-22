@@ -1,0 +1,43 @@
+# ─── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# ─── Entornos virtuales ────────────────────────────────────────
+.env
+.venv
+env/
+venv/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# ─── Streamlit cache local ────────────────────────────────────
+.streamlit/secrets.toml
+
+# ─── Archivos Excel / datos sensibles ────────────────────────
+# El archivo de datos NO se sube al repo (contiene información de negocio).
+# Usa el uploader de la app o monta un volumen en Render.
+prueba.xlsx
+*.xls
+~$*.xlsx
+~$*.xls
+
+# ─── IDEs y editores ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── Sistema operativo ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Logs y temporales ────────────────────────────────────────
+*.log
+*.tmp
+*.bak

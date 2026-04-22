@@ -345,10 +345,117 @@ def add_yearweek(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ANÁLISIS FINANCIERO — RECUPERACIÓN DE INVERSIÓN (SUBASTA)
+# CONSTANTES DE INVERSIÓN
 # ═══════════════════════════════════════════════════════════════
 CONCEPTO_SUBASTA = "PAGO DE SUBASTA"
 PAGO_SEMANAL_DEFAULT = 2_500.0  # MXN por semana
+
+# Conceptos que se clasifican como INVERSIÓN (no gasto operativo).
+# Case-insensitive. Si detectas variantes en el Excel, repórtalas.
+CONCEPTOS_INVERSION: list[str] = [
+    "INVERSIÓN",
+    "INVERSION",   # sin acento, por si acaso
+    "PAGO DE SUBASTA",
+]
+
+
+# ═══════════════════════════════════════════════════════════════
+# UTILIDADES DE FILTRADO DE EGRESOS
+# ═══════════════════════════════════════════════════════════════
+def _mask_inversion(df: pd.DataFrame) -> pd.Series:
+    """Devuelve máscara booleana True donde el concepto es INVERSIÓN.
+
+    Compara en mayúsculas y sin espacios extra para ser robusto
+    ante variaciones de capitalización en el Excel.
+    """
+    if "concepto" not in df.columns or df.empty:
+        return pd.Series(False, index=df.index)
+    conceptos_upper = [c.upper().strip() for c in CONCEPTOS_INVERSION]
+    return (
+        df["concepto"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .isin(conceptos_upper)
+    )
+
+
+def get_gastos(df_egresos: pd.DataFrame) -> pd.DataFrame:
+    """Filtra el DataFrame de egresos excluyendo conceptos de INVERSIÓN.
+
+    Usar esta función en todos los KPIs y gráficas de «gasto operativo»
+    para que la inversión no distorsione los totales.
+
+    Returns
+    -------
+    pd.DataFrame — egresos sin filas de inversión.
+    """
+    if df_egresos.empty:
+        return df_egresos.copy()
+    return df_egresos[~_mask_inversion(df_egresos)].copy()
+
+
+def get_inversiones_egreso(df_egresos: pd.DataFrame) -> pd.DataFrame:
+    """Devuelve solo las filas de egresos clasificadas como INVERSIÓN.
+
+    Usar esta función para mostrar el KPI de inversión separado del gasto.
+
+    Returns
+    -------
+    pd.DataFrame — únicamente los egresos de tipo inversión.
+    """
+    if df_egresos.empty:
+        return df_egresos.copy()
+    return df_egresos[_mask_inversion(df_egresos)].copy()
+
+
+def conductores_por_semana(df_ingresos: pd.DataFrame) -> pd.DataFrame:
+    """Cuenta conductores únicos por semana, eliminando duplicados.
+
+    Puede haber filas repetidas en el Excel (mismo conductor, misma semana).
+    Esta función deduplica por (año, semana, conductor) antes de contar,
+    evitando el sobreconteo.
+
+    Returns
+    -------
+    pd.DataFrame con columnas:
+        YEARWEEK       – clave numérica año*100+sem
+        WEEK_LABEL     – etiqueta «YYYY-SNN»
+        n_conductores  – número de conductores únicos esa semana
+    """
+    if df_ingresos.empty:
+        return pd.DataFrame(
+            columns=["YEARWEEK", "WEEK_LABEL", "n_conductores"]
+        )
+
+    required = {"año", "semana", "conductor"}
+    missing = required - set(df_ingresos.columns)
+    if missing:
+        return pd.DataFrame(
+            columns=["YEARWEEK", "WEEK_LABEL", "n_conductores"]
+        )
+
+    # Deduplicar: un conductor cuenta una sola vez por semana
+    dedup = (
+        df_ingresos
+        .dropna(subset=["semana", "conductor"])
+        .drop_duplicates(subset=["año", "semana", "conductor"])
+    )
+
+    # Asegurarnos de tener YEARWEEK y WEEK_LABEL
+    if "YEARWEEK" not in dedup.columns:
+        dedup = add_yearweek(dedup)
+
+    # Contar conductores únicos por semana
+    result = (
+        dedup
+        .groupby(["YEARWEEK", "WEEK_LABEL"], as_index=False)["conductor"]
+        .nunique()
+        .rename(columns={"conductor": "n_conductores"})
+        .sort_values("YEARWEEK")
+        .reset_index(drop=True)
+    )
+    return result
 
 
 def calcular_amortizacion(
@@ -508,8 +615,48 @@ if __name__ == "__main__":
     print(f"   Años: {sorted(df_egr['año'].unique())}")
     if len(df_egr) > 0:
         print(f"   Monto real (ejemplo):     {df_egr['monto_real'].head(3).tolist()}")
-        print(f"   Gasto total sum:          ${df_egr['monto_real'].sum():,.2f}")
+        print(f"   Gasto total sum (CON inv):${df_egr['monto_real'].sum():,.2f}")
         if "concepto" in df_egr.columns:
-            print(f"   Top conceptos:            {df_egr['concepto'].value_counts().head(5).to_dict()}")
+            print(f"   Top conceptos:            {df_egr['concepto'].value_counts().head(8).to_dict()}")
+
+    # ── Validación: separación inversión / gasto ──────────────────────────
+    print("\n" + "─" * 60)
+    print("VALIDACIÓN — Separación INVERSIÓN / GASTO OPERATIVO")
+    print("─" * 60)
+    df_gasto = get_gastos(df_egr)
+    df_inv   = get_inversiones_egreso(df_egr)
+
+    total_egr_bruto = df_egr["monto_real"].sum()   if len(df_egr)   > 0 else 0.0
+    total_gasto_val = df_gasto["monto_real"].sum() if len(df_gasto) > 0 else 0.0
+    total_inv_val   = df_inv["monto_real"].sum()   if len(df_inv)   > 0 else 0.0
+
+    print(f"  Egresos TOTALES (con inversión):  ${total_egr_bruto:>12,.2f}")
+    print(f"  Gasto OPERATIVO  (sin inversión): ${total_gasto_val:>12,.2f}")
+    print(f"  INVERSIÓN separada:               ${total_inv_val:>12,.2f}")
+    cuadre_ok = abs((total_gasto_val + total_inv_val) - total_egr_bruto) < 0.01
+    print(f"  ✓ Cuadre (gasto + inv = total):   {'OK' if cuadre_ok else '⚠️ DIFERENCIA'}")
+
+    if len(df_inv) > 0 and "concepto" in df_inv.columns:
+        print(f"\n  Conceptos detectados como INVERSIÓN:")
+        for concepto, cnt in df_inv["concepto"].value_counts().items():
+            monto = df_inv.loc[df_inv["concepto"] == concepto, "monto_real"].sum()
+            print(f"    • {str(concepto):30s}  {cnt:3d} filas  ${monto:,.2f}")
+    else:
+        print("  (No se encontraron filas de inversión en el período)")
+
+    # ── Validación: conductores únicos por semana ─────────────────────────
+    print("\n" + "─" * 60)
+    print("VALIDACIÓN — Conductores únicos por semana")
+    print("─" * 60)
+    df_ing_yw = add_yearweek(df_ing) if "YEARWEEK" not in df_ing.columns else df_ing
+    cond_sem = conductores_por_semana(df_ing_yw)
+    if len(cond_sem) > 0:
+        print(f"  Semanas con datos: {len(cond_sem)}")
+        print(f"  Conductores únicos promedio/semana: {cond_sem['n_conductores'].mean():.1f}")
+        print(f"  Máx: {cond_sem['n_conductores'].max()}  Mín: {cond_sem['n_conductores'].min()}")
+        print(f"\n  Primeras filas:")
+        print(cond_sem.head(5).to_string(index=False))
+    else:
+        print("  (Sin datos de conductores)")
 
     print("\n✅ Módulo business_rules.py OK")
