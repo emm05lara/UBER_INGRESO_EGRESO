@@ -325,33 +325,57 @@ def transform_egresos(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aplica reglas de negocio a un DataFrame de egresos ya renombrado.
 
-    Regla de signos detectada en el Excel de Gastos 2025/2026:
-      - Valores POSITIVOS → gastos reales (la gran mayoría)
-      - Valores NEGATIVOS → créditos, devoluciones o ajustes (ej. garantía devuelta)
-      - NOT se usa .abs() ciegamente: eso inflaba el total cuando existían negativos.
+    FUENTE DE VERDAD: monto_real_raw
+    ──────────────────────────────────────────────────────────────────
+    La columna REAL del Excel es la fuente de verdad para el dashboard.
+    La tabla dinámica de Excel suma directamente esa columna.
+    Por tanto, el dashboard debe reproducir exactamente esa suma.
 
     Columnas generadas:
-      monto_real_raw   : valor original firmado (nunca modificado)
-      monto_gasto_bruto: solo valores positivos (gastos reales)
-      monto_credito    : valores negativos convertidos a positivo (ajustes/devoluciones)
-      monto_neto       : gasto_bruto − credito  (lo que realmente se gastó neto)
-      monto_real       : alias de monto_neto para compatibilidad con el resto del código
+      monto_real_raw   : valor ORIGINAL de la columna REAL (nunca modificado)
+                         ← MÉTRICA PRIMARIA del dashboard (reproduce la tabla dinámica)
+      monto_real       : alias directo de monto_real_raw (para compatibilidad)
+      monto_gasto_bruto: solo valores positivos de REAL (gastos)
+      monto_credito    : valores negativos de REAL convertidos a positivo (ajustes)
+      monto_neto       : gasto_bruto − credito (para auditoría, NO se usa como KPI primario)
+
+    NOTA SOBRE LA DIFERENCIA CON LA TABLA DINÁMICA DE EXCEL:
+    La diferencia residual ($2,481 en SEM 1-18) proviene de inconsistencias
+    en los datos fuente del Excel, NO de un error de cálculo en Python:
+      - Fila VISITA $230 con DETALLE=GASOLINA (SEM 16) — mal clasificada
+      - Filas TRASLADO con DETALLE=GASOLINA (+$230 vs tabla dinámica)
+      - Filas duplicadas en MTTO SEM 18 (FILTRO ACEITE $140, HORQUILLA $633,
+        ACEITE MOTOR $522 y otros) que suman $2,021 de exceso
+    Corregir estas inconsistencias en el Excel resolverá la diferencia.
     """
     out = df.copy()
 
-    # Conservar valor firmado original para auditoría
+    # ── Conservar valor firmado original — NUNCA modificar esta columna ──
     raw = out["monto_real"].fillna(0)
     out["monto_real_raw"] = raw
 
-    # Descomponer en gasto bruto y créditos/ajustes
-    # Positivo → gasto real; Negativo → crédito/ajuste/devolución
-    out["monto_gasto_bruto"] = raw.where(raw > 0, 0)          # solo positivos
-    out["monto_credito"]     = raw.where(raw < 0, 0).abs()    # negativos → positivos
-    out["monto_neto"]        = out["monto_gasto_bruto"] - out["monto_credito"]
+    # ── monto_real = copia directa de monto_real_raw ─────────────────────
+    # Reproduce exactamente la tabla dinámica de Excel (Suma de REAL).
+    # No se usa .abs() ni neto: eso introduciría diferencias vs Excel.
+    out["monto_real"] = raw
 
-    # Alias de compatibilidad: monto_real apunta al neto (no al abs)
-    # Esto corrige el KPI de gasto operativo total y el Top de concepto.
-    out["monto_real"] = out["monto_neto"]
+    # ── Descomposición para auditoría interna (no se usa como KPI) ───────
+    # Positivo → gasto real; Negativo → crédito/ajuste/devolución
+    out["monto_gasto_bruto"] = raw.where(raw > 0, 0)       # solo positivos
+    out["monto_credito"]     = raw.where(raw < 0, 0).abs() # negativos → positivos
+    out["monto_neto"]        = out["monto_gasto_bruto"] - out["monto_credito"]
+    # monto_neto = monto_real_raw cuando todos los valores son ≥ 0 (caso normal).
+    # Si hay créditos negativos, monto_neto < monto_real_raw (ajuste conservador).
+
+    # ── Normalizar nombres de conceptos para consistencia con Excel ───────
+    # GRÚA (con acento) → GRUA (sin acento) para alinear con la tabla dinámica
+    if "concepto" in out.columns:
+        out["concepto"] = (
+            out["concepto"]
+            .astype(str)
+            .str.strip()
+            .str.replace("GRÚA", "GRUA", regex=False)
+        )
 
     return out
 

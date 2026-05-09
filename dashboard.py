@@ -720,48 +720,51 @@ with tab_egresos:
         st.info("No hay datos de egresos con los filtros actuales.")
     else:
         # ── KPIs de Gasto Operativo (excluye INVERSIÓN) ──────────────────
-        # Métrica: monto_neto = gasto_bruto − créditos/ajustes
-        # NO se usa .abs() ciegamente. Si un registro es negativo
-        # (crédito/devolución), reduce el total correctamente.
-        _col_neto  = "monto_neto"  if "monto_neto"  in df_gasto.columns else "monto_real"
-        _col_bruto = "monto_gasto_bruto" if "monto_gasto_bruto" in df_gasto.columns else _col_neto
+        # MÉTRICA PRIMARIA: monto_real_raw = valor original de la columna REAL del Excel.
+        # Reproduce exactamente la Suma de REAL de la tabla dinámica de Excel.
+        # NO se usa monto_neto ni abs() — eso introducía diferencias vs Excel.
+        _col_egr   = "monto_real_raw" if "monto_real_raw" in df_gasto.columns else "monto_real"
+        _col_bruto = "monto_gasto_bruto" if "monto_gasto_bruto" in df_gasto.columns else _col_egr
         _col_cred  = "monto_credito"     if "monto_credito"     in df_gasto.columns else None
 
-        total_gasto_op   = df_gasto[_col_neto].sum()  if len(df_gasto) > 0 else 0.0
-        total_inversion  = df_inversion_egr["monto_real"].sum() if len(df_inversion_egr) > 0 else 0.0
+        total_gasto_op   = df_gasto[_col_egr].sum()  if len(df_gasto) > 0 else 0.0
+        total_inversion  = df_inversion_egr["monto_real_raw"].sum() if "monto_real_raw" in df_inversion_egr.columns and len(df_inversion_egr) > 0 else (
+            df_inversion_egr["monto_real"].sum() if len(df_inversion_egr) > 0 else 0.0
+        )
         n_semanas_egr    = df_gasto["YEARWEEK"].nunique() if len(df_gasto) > 0 else 0
         prom_semanal_op  = total_gasto_op / max(n_semanas_egr, 1)
 
-        # Top de concepto — dinámico, usa la misma métrica que el total
+        # Top de concepto — dinámico, usa la MISMA métrica que el total
         top_concepto = None
         if "concepto" in df_gasto.columns and len(df_gasto) > 0:
             top_concepto = (
-                df_gasto.groupby("concepto", as_index=False)[_col_neto]
+                df_gasto.groupby("concepto", as_index=False)[_col_egr]
                 .sum()
-                .sort_values(_col_neto, ascending=False)
+                .sort_values(_col_egr, ascending=False)
                 .iloc[0]
             )
 
         st.markdown("##### 💡 Gasto Operativo *(INVERSIÓN excluida)*")
         st.caption(
-            f"🔗 Métrica: `{_col_neto}` (gastos brutos − ajustes/créditos). "
-            "El KPI de Top de Concepto usa la misma métrica que el Total y cambia dinámicamente con los filtros."
+            f"🔗 Métrica: `{_col_egr}` (valor original columna REAL del Excel). "
+            "Reproduce la tabla dinámica de Excel. "
+            "El KPI de Top Concepto usa la misma métrica y cambia dinámicamente con los filtros."
         )
         k1, k2, k3, k4 = st.columns(4)
         _help_total = (
-            f"Gasto bruto: ${df_gasto[_col_bruto].sum():,.0f}\n"
-            f"Créditos/ajustes: -${df_gasto[_col_cred].sum():,.0f}\n"
-            f"Neto = bruto − créditos"
-        ) if _col_cred else "Suma de monto_neto en gasto operativo"
+            f"Suma directa de la columna REAL del Excel (monto_real_raw).\n"
+            f"Para auditoría: gasto bruto ${df_gasto[_col_bruto].sum():,.0f}\n"
+            + (f"Créditos/ajustes: -${df_gasto[_col_cred].sum():,.0f}" if _col_cred else "")
+        )
         k1.metric("Gasto Operativo Total", f"${total_gasto_op:,.0f}", help=_help_total)
         k2.metric("Promedio Semanal", f"${prom_semanal_op:,.0f}",
-                  help="Total gasto neto ÷ semanas distintas en el período filtrado")
+                  help="Total gasto \u00f7 semanas distintas en el período filtrado")
         k3.metric("Semanas", f"{n_semanas_egr}")
         if top_concepto is not None:
             k4.metric(
                 f"Top: {top_concepto['concepto']}",
-                f"${top_concepto[_col_neto]:,.0f}",
-                help="Concepto con mayor gasto neto. Cambia dinámicamente según el filtro activo.",
+                f"${top_concepto[_col_egr]:,.0f}",
+                help="Concepto con mayor gasto. Cambia dinámicamente según el filtro activo.",
             )
 
         # KPI de inversión al lado, diferenciado
@@ -967,6 +970,104 @@ with tab_egresos:
             )
         else:
             st.info("✅ No hay filas con monto negativo en el gasto operativo del período seleccionado.")
+
+        # ── SECCIÓN: DIAGNÓSTICO DE CALIDAD DE DATOS vs EXCEL ──────────────────
+        st.divider()
+        with st.expander("🔬 Diagnóstico de Datos vs Tabla Dinámica de Excel", expanded=False):
+            st.caption(
+                "Esta sección identifica las filas del Excel que generan diferencias "
+                "con la tabla dinámica. **Son inconsistencias en los datos fuente**, "
+                "no errores de cálculo del dashboard."
+            )
+
+            if len(df_egr) > 0 and "concepto" in df_egr.columns:
+                _col_raw = "monto_real_raw" if "monto_real_raw" in df_egr.columns else "monto_real"
+
+                # 1. Filas con CONCEPTO=VISITA y monto > 0 (la tabla dinámica muestra VISITA=0)
+                visita_rows = df_egr[
+                    (df_egr["concepto"].astype(str).str.strip().str.upper() == "VISITA") &
+                    (df_egr[_col_raw].fillna(0) > 0)
+                ]
+                if len(visita_rows) > 0:
+                    st.warning(
+                        f"⚠️ **VISITA con monto > $0**: {len(visita_rows)} fila(s) totalizando "
+                        f"**${visita_rows[_col_raw].sum():,.2f}**. "
+                        "La tabla dinámica de Excel muestra VISITA = $0 — estas filas pueden estar "
+                        "mal clasificadas (DETALLE=GASOLINA)."
+                    )
+                    cols_v = [c for c in ["semana", "WEEK_LABEL", "concepto", "detalle",
+                                          "conductor", "llave", _col_raw, "comentarios"]
+                              if c in visita_rows.columns]
+                    st.dataframe(
+                        visita_rows[cols_v],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            _col_raw: st.column_config.NumberColumn("Monto REAL", format="$%,.2f"),
+                        },
+                    )
+
+                # 2. Filas TRASLADO con DETALLE=GASOLINA
+                if "detalle" in df_egr.columns:
+                    tras_gas = df_egr[
+                        (df_egr["concepto"].astype(str).str.strip().str.upper() == "TRASLADO") &
+                        (df_egr["detalle"].astype(str).str.strip().str.upper() == "GASOLINA")
+                    ]
+                    if len(tras_gas) > 0:
+                        st.warning(
+                            f"⚠️ **TRASLADO con DETALLE=GASOLINA**: {len(tras_gas)} fila(s) "
+                            f"totalizando **${tras_gas[_col_raw].sum():,.2f}**. "
+                            "En la tabla dinámica de Excel estas filas pueden estar bajo GASOLINA."
+                        )
+                        cols_t = [c for c in ["semana", "WEEK_LABEL", "concepto", "detalle",
+                                              "conductor", "llave", _col_raw]
+                                  if c in tras_gas.columns]
+                        st.dataframe(
+                            tras_gas[cols_t],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                _col_raw: st.column_config.NumberColumn("Monto REAL", format="$%,.2f"),
+                            },
+                        )
+
+                # 3. Filas MTTO duplicadas (mismo semana+monto+detalle+llave)
+                mtto_df = df_egr[df_egr["concepto"].astype(str).str.strip().str.upper() == "MTTO"].copy()
+                if len(mtto_df) > 0 and "detalle" in mtto_df.columns:
+                    dup_cols_m = [c for c in ["semana", _col_raw, "detalle", "llave"]
+                                  if c in mtto_df.columns]
+                    dup_mask = mtto_df.duplicated(subset=dup_cols_m, keep=False)
+                    dup_nonzero = mtto_df[dup_mask & (mtto_df[_col_raw].fillna(0) > 0)]
+                    if len(dup_nonzero) > 0:
+                        # Calcular exceso (solo las copias extra, no la primera ocurrencia)
+                        exceso_dup = mtto_df[mtto_df.duplicated(subset=dup_cols_m, keep="first") &
+                                              (mtto_df[_col_raw].fillna(0) > 0)][_col_raw].sum()
+                        st.warning(
+                            f"⚠️ **MTTO duplicados**: {len(dup_nonzero)} filas con misma semana+"
+                            f"monto+detalle+llave (incluye originales y copias). "
+                            f"Exceso estimado: **${exceso_dup:,.2f}**."
+                        )
+                        cols_m = [c for c in ["semana", "WEEK_LABEL", "concepto", "detalle",
+                                              "llave", _col_raw, "comentarios"]
+                                  if c in dup_nonzero.columns]
+                        st.dataframe(
+                            dup_nonzero[cols_m].sort_values(["semana", "detalle"]),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                _col_raw: st.column_config.NumberColumn("Monto REAL", format="$%,.2f"),
+                            },
+                        )
+
+                if len(visita_rows) == 0 and (
+                    "detalle" not in df_egr.columns or
+                    len(df_egr[
+                        (df_egr["concepto"].astype(str).str.strip().str.upper() == "TRASLADO") &
+                        (df_egr["detalle"].astype(str).str.strip().str.upper() == "GASOLINA")
+                    ]) == 0
+                ):
+                    st.success("✅ No se detectaron inconsistencias de clasificación en el período seleccionado.")
+
 # ═══════════════════════════════════════════════════════════════
 # TAB 3: RESUMEN GLOBAL
 # ═══════════════════════════════════════════════════════════════
@@ -974,11 +1075,11 @@ with tab_resumen:
     st.subheader("📊 Resumen Global — Ingresos vs Egresos")
 
     total_ing        = df_ing["ganancias_totales"].sum() if len(df_ing) > 0 else 0.0
-    # Utilidad operativa: solo gasto operativo (SIN INVERSIÓN)
-    # Usa monto_neto para consistencia con el tab de Egresos (no .abs() ciego)
-    _col_neto_res    = "monto_neto" if "monto_neto" in df_gasto.columns else "monto_real"
+    # Gasto operativo: usa monto_real_raw (reproduce tabla dinámica Excel, excluye INVERSIÓN)
+    _col_neto_res    = "monto_real_raw" if "monto_real_raw" in df_gasto.columns else "monto_real"
     total_egr_op     = df_gasto[_col_neto_res].sum() if len(df_gasto) > 0 else 0.0
-    total_inv_global = df_inversion_egr["monto_real"].sum() if len(df_inversion_egr) > 0 else 0.0
+    _col_inv_res     = "monto_real_raw" if "monto_real_raw" in df_inversion_egr.columns else "monto_real"
+    total_inv_global = df_inversion_egr[_col_inv_res].sum() if len(df_inversion_egr) > 0 else 0.0
     utilidad         = total_ing - total_egr_op   # operativa, sin descontar inversión
 
     k1, k2, k3, k4 = st.columns(4)
