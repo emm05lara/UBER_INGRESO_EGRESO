@@ -21,6 +21,7 @@ from business_rules import (
     get_inversiones_egreso,
     conductores_por_semana,
     auditoria_signos,
+    auditoria_egresos,
     PAGO_SEMANAL_DEFAULT,
     CONCEPTOS_INVERSION,
 )
@@ -719,25 +720,49 @@ with tab_egresos:
         st.info("No hay datos de egresos con los filtros actuales.")
     else:
         # ── KPIs de Gasto Operativo (excluye INVERSIÓN) ──────────────────
-        total_gasto_op   = df_gasto["monto_real"].sum() if len(df_gasto) > 0 else 0.0
+        # Métrica: monto_neto = gasto_bruto − créditos/ajustes
+        # NO se usa .abs() ciegamente. Si un registro es negativo
+        # (crédito/devolución), reduce el total correctamente.
+        _col_neto  = "monto_neto"  if "monto_neto"  in df_gasto.columns else "monto_real"
+        _col_bruto = "monto_gasto_bruto" if "monto_gasto_bruto" in df_gasto.columns else _col_neto
+        _col_cred  = "monto_credito"     if "monto_credito"     in df_gasto.columns else None
+
+        total_gasto_op   = df_gasto[_col_neto].sum()  if len(df_gasto) > 0 else 0.0
         total_inversion  = df_inversion_egr["monto_real"].sum() if len(df_inversion_egr) > 0 else 0.0
         n_semanas_egr    = df_gasto["YEARWEEK"].nunique() if len(df_gasto) > 0 else 0
         prom_semanal_op  = total_gasto_op / max(n_semanas_egr, 1)
+
+        # Top de concepto — dinámico, usa la misma métrica que el total
         top_concepto = None
         if "concepto" in df_gasto.columns and len(df_gasto) > 0:
             top_concepto = (
-                df_gasto.groupby("concepto", as_index=False)["monto_real"].sum()
-                .sort_values("monto_real", ascending=False)
+                df_gasto.groupby("concepto", as_index=False)[_col_neto]
+                .sum()
+                .sort_values(_col_neto, ascending=False)
                 .iloc[0]
             )
 
         st.markdown("##### 💡 Gasto Operativo *(INVERSIÓN excluida)*")
+        st.caption(
+            f"🔗 Métrica: `{_col_neto}` (gastos brutos − ajustes/créditos). "
+            "El KPI de Top de Concepto usa la misma métrica que el Total y cambia dinámicamente con los filtros."
+        )
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Gasto Operativo Total", f"${total_gasto_op:,.0f}")
-        k2.metric("Promedio Semanal", f"${prom_semanal_op:,.0f}")
+        _help_total = (
+            f"Gasto bruto: ${df_gasto[_col_bruto].sum():,.0f}\n"
+            f"Créditos/ajustes: -${df_gasto[_col_cred].sum():,.0f}\n"
+            f"Neto = bruto − créditos"
+        ) if _col_cred else "Suma de monto_neto en gasto operativo"
+        k1.metric("Gasto Operativo Total", f"${total_gasto_op:,.0f}", help=_help_total)
+        k2.metric("Promedio Semanal", f"${prom_semanal_op:,.0f}",
+                  help="Total gasto neto ÷ semanas distintas en el período filtrado")
         k3.metric("Semanas", f"{n_semanas_egr}")
         if top_concepto is not None:
-            k4.metric(f"Top: {top_concepto['concepto']}", f"${top_concepto['monto_real']:,.0f}")
+            k4.metric(
+                f"Top: {top_concepto['concepto']}",
+                f"${top_concepto[_col_neto]:,.0f}",
+                help="Concepto con mayor gasto neto. Cambia dinámicamente según el filtro activo.",
+            )
 
         # KPI de inversión al lado, diferenciado
         st.markdown("##### 🏦 Inversión *(separada del gasto operativo)*")
@@ -866,8 +891,82 @@ with tab_egresos:
                 f"Conceptos que se clasifican como inversión: {', '.join(CONCEPTOS_INVERSION)}"
             )
 
+        # ── SECCIÓN: AUDITORÍA DE EGRESOS ──────────────────────────────────
+        st.divider()
+        st.markdown("#### 🔍 Auditoría de Egresos")
+        st.caption(
+            "Esta tabla muestra el desglose por concepto: gastos positivos vs. ajustes/créditos negativos. "
+            "**Suma absoluta** és lo que mostraba el dashboard anterior (con `.abs()`). "
+            "**Neto** es el valor correcto (gastos brutos − ajustes)."
+        )
 
+        # Pasar el df de gasto ya filtrado (respeta los filtros activos)
+        aud_egr_conc, aud_egr_sosp = auditoria_egresos(df_gasto)
 
+        if not aud_egr_conc.empty:
+            # Totales del pie
+            total_row = pd.DataFrame([{
+                "Concepto":         "⟹ TOTAL",
+                "Suma raw firmada":  aud_egr_conc["Suma raw firmada"].sum(),
+                "Suma absoluta":     aud_egr_conc["Suma absoluta"].sum(),
+                "Gastos positivos":  aud_egr_conc["Gastos positivos"].sum(),
+                "Ajustes/Créditos": aud_egr_conc["Ajustes/Créditos"].sum(),
+                "Neto":              aud_egr_conc["Neto"].sum(),
+                "Filas positivas":   aud_egr_conc["Filas positivas"].sum(),
+                "Filas negativas":   aud_egr_conc["Filas negativas"].sum(),
+                "Filas cero/nulas":  aud_egr_conc["Filas cero/nulas"].sum(),
+            }])
+            aud_egr_display = pd.concat([aud_egr_conc, total_row], ignore_index=True)
+
+            st.dataframe(
+                aud_egr_display,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Concepto":          st.column_config.TextColumn("Concepto"),
+                    "Suma raw firmada":   st.column_config.NumberColumn("Suma Raw firmada",  format="$%,.2f"),
+                    "Suma absoluta":      st.column_config.NumberColumn("Suma Abs (antes)",   format="$%,.2f"),
+                    "Gastos positivos":   st.column_config.NumberColumn("Gastos positivos",   format="$%,.2f"),
+                    "Ajustes/Créditos":  st.column_config.NumberColumn("Ajustes/Créditos",  format="$%,.2f"),
+                    "Neto":               st.column_config.NumberColumn("Neto ✓",             format="$%,.2f"),
+                    "Filas positivas":    st.column_config.NumberColumn("Filas pos"),
+                    "Filas negativas":    st.column_config.NumberColumn("Filas neg"),
+                    "Filas cero/nulas":   st.column_config.NumberColumn("Nulas"),
+                },
+            )
+
+            # Resaltar inflación si existe
+            total_abs  = float(aud_egr_conc["Suma absoluta"].sum())
+            total_neto = float(aud_egr_conc["Neto"].sum())
+            inflacion  = total_abs - total_neto
+            total_cred = float(aud_egr_conc["Ajustes/Créditos"].sum())
+            if inflacion > 0.01:
+                st.warning(
+                    f"⚠️ El método anterior (abs) sobreestimaba el gasto operativo en "
+                    f"**${inflacion:,.2f}** debido a {int(aud_egr_conc['Filas negativas'].sum())} "
+                    f"ajuste(s)/crédito(s) por **${total_cred:,.2f}** que se contaban como gastos."
+                )
+            else:
+                st.success("✅ Sin diferencia entre suma absoluta y neto — no hay ajustes negativos en el período.")
+
+        # Tabla de filas sospechosas
+        if not aud_egr_sosp.empty:
+            st.markdown("##### 🚨 Filas con monto negativo (ajustes/créditos)")
+            st.caption(
+                "Estas filas tienen un monto negativo en la columna REAL del Excel. "
+                "Se interpretan como ajustes, devoluciones o créditos que **reducen** el gasto operativo."
+            )
+            st.dataframe(
+                aud_egr_sosp,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "monto_original":    st.column_config.NumberColumn("Monto original",    format="$%,.2f"),
+                    "monto_interpretado": st.column_config.NumberColumn("Neto interpretado", format="$%,.2f"),
+                },
+            )
+        else:
+            st.info("✅ No hay filas con monto negativo en el gasto operativo del período seleccionado.")
 # ═══════════════════════════════════════════════════════════════
 # TAB 3: RESUMEN GLOBAL
 # ═══════════════════════════════════════════════════════════════
@@ -876,7 +975,9 @@ with tab_resumen:
 
     total_ing        = df_ing["ganancias_totales"].sum() if len(df_ing) > 0 else 0.0
     # Utilidad operativa: solo gasto operativo (SIN INVERSIÓN)
-    total_egr_op     = df_gasto["monto_real"].sum() if len(df_gasto) > 0 else 0.0
+    # Usa monto_neto para consistencia con el tab de Egresos (no .abs() ciego)
+    _col_neto_res    = "monto_neto" if "monto_neto" in df_gasto.columns else "monto_real"
+    total_egr_op     = df_gasto[_col_neto_res].sum() if len(df_gasto) > 0 else 0.0
     total_inv_global = df_inversion_egr["monto_real"].sum() if len(df_inversion_egr) > 0 else 0.0
     utilidad         = total_ing - total_egr_op   # operativa, sin descontar inversión
 

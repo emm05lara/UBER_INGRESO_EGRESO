@@ -322,9 +322,106 @@ def auditoria_signos(df_ing: pd.DataFrame) -> pd.DataFrame:
 # TRANSFORMACIONES — EGRESOS
 # ═══════════════════════════════════════════════════════════════
 def transform_egresos(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica reglas de negocio a un DataFrame de egresos ya renombrado.
+
+    Regla de signos detectada en el Excel de Gastos 2025/2026:
+      - Valores POSITIVOS → gastos reales (la gran mayoría)
+      - Valores NEGATIVOS → créditos, devoluciones o ajustes (ej. garantía devuelta)
+      - NOT se usa .abs() ciegamente: eso inflaba el total cuando existían negativos.
+
+    Columnas generadas:
+      monto_real_raw   : valor original firmado (nunca modificado)
+      monto_gasto_bruto: solo valores positivos (gastos reales)
+      monto_credito    : valores negativos convertidos a positivo (ajustes/devoluciones)
+      monto_neto       : gasto_bruto − credito  (lo que realmente se gastó neto)
+      monto_real       : alias de monto_neto para compatibilidad con el resto del código
+    """
     out = df.copy()
-    out["monto_real"] = out["monto_real"].fillna(0).abs()
+
+    # Conservar valor firmado original para auditoría
+    raw = out["monto_real"].fillna(0)
+    out["monto_real_raw"] = raw
+
+    # Descomponer en gasto bruto y créditos/ajustes
+    # Positivo → gasto real; Negativo → crédito/ajuste/devolución
+    out["monto_gasto_bruto"] = raw.where(raw > 0, 0)          # solo positivos
+    out["monto_credito"]     = raw.where(raw < 0, 0).abs()    # negativos → positivos
+    out["monto_neto"]        = out["monto_gasto_bruto"] - out["monto_credito"]
+
+    # Alias de compatibilidad: monto_real apunta al neto (no al abs)
+    # Esto corrige el KPI de gasto operativo total y el Top de concepto.
+    out["monto_real"] = out["monto_neto"]
+
     return out
+
+
+def auditoria_egresos(df_egr: pd.DataFrame) -> tuple["pd.DataFrame", "pd.DataFrame"]:
+    """
+    Genera dos DataFrames de auditoría de egresos:
+
+    1. tabla_concepto — resumen por concepto con columnas:
+       Concepto | Suma raw firmada | Suma absoluta | Gastos positivos |
+       Ajustes/Créditos | Neto | Filas positivas | Filas negativas | Filas cero/nulas
+
+    2. tabla_sospechosas — filas con monto negativo (ajustes/créditos) con detalle.
+
+    Parámetro
+    ---------
+    df_egr : DataFrame de egresos ya transformado (incluye monto_real_raw,
+             monto_gasto_bruto, monto_credito, monto_neto)
+    """
+    if df_egr.empty or "concepto" not in df_egr.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    raw_col = "monto_real_raw" if "monto_real_raw" in df_egr.columns else "monto_real"
+
+    # ── Tabla por concepto ───────────────────────────────────────────
+    filas = []
+    for conc, grupo in df_egr.groupby("concepto"):
+        s = grupo[raw_col].fillna(0)
+        pos  = s[s > 0]
+        neg  = s[s < 0]
+        cero = grupo[raw_col].isna().sum() + (s == 0).sum()
+
+        filas.append({
+            "Concepto":           conc,
+            "Suma raw firmada":   round(float(s.sum()), 2),
+            "Suma absoluta":      round(float(s.abs().sum()), 2),
+            "Gastos positivos":   round(float(pos.sum()), 2),
+            "Ajustes/Créditos":   round(float(neg.abs().sum()), 2),
+            "Neto":               round(float(pos.sum()) - float(neg.abs().sum()), 2),
+            "Filas positivas":    int((s > 0).sum()),
+            "Filas negativas":    int((s < 0).sum()),
+            "Filas cero/nulas":   int(cero),
+        })
+
+    tabla_concepto = (
+        pd.DataFrame(filas)
+        .sort_values("Neto", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    # ── Tabla de filas sospechosas (montos negativos) ────────────────
+    mask_neg = df_egr[raw_col].fillna(0) < 0
+    sosp = df_egr[mask_neg].copy()
+
+    cols_sosp = []
+    for c in ["año", "semana", "fecha", "concepto", "detalle",
+               "conductor", "llave", "socio",
+               raw_col, "monto_neto", "comentarios"]:
+        if c in sosp.columns:
+            cols_sosp.append(c)
+
+    tabla_sospechosas = sosp[cols_sosp].copy()
+    # Renombrar para claridad
+    rename_sosp = {
+        raw_col:      "monto_original",
+        "monto_neto": "monto_interpretado",
+    }
+    tabla_sospechosas = tabla_sospechosas.rename(columns={k: v for k, v in rename_sosp.items() if k in tabla_sospechosas.columns})
+
+    return tabla_concepto, tabla_sospechosas
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -453,6 +550,11 @@ CONCEPTOS_INVERSION: list[str] = [
     "INVERSIÓN",
     "INVERSION",
     "PAGO DE SUBASTA",
+    "PAGO SUBASTA",
+    "SUBASTA",
+    "COMPRA VEHICULO",
+    "COMPRA VEHÍCULO",
+    "COMPRA VEHICULO",
 ]
 
 
@@ -604,11 +706,11 @@ if __name__ == "__main__":
     print("=" * 60)
 
     df_ing = load_ingresos()
-    print(f"\n Ingresos: {len(df_ing)} filas, anios: {sorted(df_ing['anio'].unique()) if 'anio' in df_ing.columns else sorted(df_ing['año'].unique())}")
+    print(f"\n Ingresos: {len(df_ing)} filas, años: {sorted(df_ing['año'].unique())}")
 
-    # Prueba de signos 2026
+    # Prueba de signos ingresos 2026
     df26 = df_ing[df_ing["año"] == 2026]
-    print("\n--- VALIDACION SIGNOS 2026 ---")
+    print("\n--- VALIDACION SIGNOS INGRESOS 2026 ---")
     for concepto, col_raw, col_cargo, col_cred, col_neto in [
         ("Multa",      "multa_raw",       "multa_cargo",       "multa_credito",       "multa_neto"),
         ("Hojalatero", "hojalatero_raw",  "hojalatero_cargo",  "hojalatero_credito",  "hojalatero_neto"),
@@ -624,9 +726,60 @@ if __name__ == "__main__":
         print(f"    neto (KPI nuevo): {df26[col_neto].sum():>12,.2f}")
         print(f"    abs() (anterior): {df26[col_raw].fillna(0).abs().sum():>12,.2f}")
 
-    # Tabla de auditoria
-    print("\n--- TABLA DE AUDITORIA ---")
+    # Tabla de auditoria ingresos
+    print("\n--- TABLA DE AUDITORIA INGRESOS ---")
     aud = auditoria_signos(df26)
     print(aud.to_string(index=False))
+
+    # ── PRUEBAS DE EGRESOS ───────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("PRUEBAS EGRESOS")
+    print("=" * 60)
+
+    df_egr = load_egresos()
+    df_gasto = get_gastos(df_egr)
+    df_inv   = get_inversiones_egreso(df_egr)
+
+    print(f"\nEgresos totales  : {len(df_egr)} filas")
+    print(f"Gasto operativo  : {len(df_gasto)} filas")
+    print(f"Inversión        : {len(df_inv)} filas")
+
+    print("\n--- VALIDACION GASTO OPERATIVO (comparar contra Excel) ---")
+    if "monto_real_raw" in df_gasto.columns:
+        print(f"  Suma raw firmada   : {df_gasto['monto_real_raw'].sum():>15,.2f}  ← suma firmada original")
+        print(f"  Suma absoluta      : {df_gasto['monto_real_raw'].abs().sum():>15,.2f}  ← lo que mostraba el dashboard anterior")
+        print(f"  Gasto bruto        : {df_gasto['monto_gasto_bruto'].sum():>15,.2f}  ← solo positivos")
+        print(f"  Créditos/ajustes   : {df_gasto['monto_credito'].sum():>15,.2f}  ← negativos convertidos a positivo")
+        print(f"  Neto (CORRECTO)    : {df_gasto['monto_neto'].sum():>15,.2f}  ← gasto bruto - créditos  ✓")
+        inflacion = df_gasto["monto_real_raw"].abs().sum() - df_gasto["monto_neto"].sum()
+        print(f"  Inflación corregida: {inflacion:>15,.2f}  ← diferencia abs() vs neto")
+    else:
+        print(f"  monto_real (neto)  : {df_gasto['monto_real'].sum():>15,.2f}")
+
+    print("\n--- VALIDACION INVERSION ---")
+    inv_col = "monto_real_raw" if "monto_real_raw" in df_inv.columns else "monto_real"
+    neto_col = "monto_neto" if "monto_neto" in df_inv.columns else "monto_real"
+    print(f"  Inversión raw      : {df_inv[inv_col].sum():>15,.2f}")
+    print(f"  Inversión neta     : {df_inv[neto_col].sum():>15,.2f}")
+
+    print("\n--- RANKING POR CONCEPTO (Gasto Operativo Neto) ---")
+    cols_rank = [c for c in ["monto_real_raw", "monto_gasto_bruto", "monto_credito", "monto_neto"]
+                 if c in df_gasto.columns]
+    if cols_rank and "concepto" in df_gasto.columns:
+        ranking = (
+            df_gasto
+            .groupby("concepto")[cols_rank]
+            .sum()
+            .sort_values("monto_neto" if "monto_neto" in cols_rank else cols_rank[0], ascending=False)
+        )
+        print(ranking.head(10).to_string())
+
+    print("\n--- AUDITORIA EGRESOS POR CONCEPTO ---")
+    tabla_conc, tabla_sosp = auditoria_egresos(df_gasto)
+    if not tabla_conc.empty:
+        print(tabla_conc.to_string(index=False))
+    if not tabla_sosp.empty:
+        print(f"\nFilas con monto negativo ({len(tabla_sosp)} filas):")
+        print(tabla_sosp.to_string(index=False))
 
     print("\n business_rules.py OK")
