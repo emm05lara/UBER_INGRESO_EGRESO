@@ -20,6 +20,7 @@ from business_rules import (
     get_gastos,
     get_inversiones_egreso,
     conductores_por_semana,
+    auditoria_signos,
     PAGO_SEMANAL_DEFAULT,
     CONCEPTOS_INVERSION,
 )
@@ -463,21 +464,53 @@ with tab_ingresos:
     if len(df_ing) == 0:
         st.info("No hay datos de ingresos con los filtros actuales.")
     else:
-        # KPIs
-        total_renta = df_ing["renta_semanal"].sum()
-        total_fianza = df_ing["fianza"].sum()
-        total_multa = df_ing["multa"].sum()
-        total_hojalatero = df_ing["hojalatero"].sum()
-        total_descuentos = df_ing["descuentos"].sum()
-        total_ganancias = df_ing["ganancias_totales"].sum()
+        # ── KPIs con lógica de signos correcta (sin abs() ciego) ─────────
+        total_renta       = df_ing["renta_semanal"].sum()
+        total_fianza      = df_ing["fianza"].sum()
+        total_ganancias   = df_ing["ganancias_totales"].sum()
 
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric("Renta Total", f"${total_renta:,.0f}")
-        k2.metric("Fianza Neta", f"${total_fianza:,.0f}")
-        k3.metric("Multas", f"${total_multa:,.0f}")
-        k4.metric("Hojalatero", f"${total_hojalatero:,.0f}")
-        k5.metric("Descuentos", f"${total_descuentos:,.0f}")
-        k6.metric("Ganancias Totales", f"${total_ganancias:,.0f}")
+        # Columnas neto (cargo - crédito): NO inflan por valores positivos
+        total_multa_cargo    = df_ing["multa_cargo"].sum()       if "multa_cargo"    in df_ing.columns else 0
+        total_multa_cred     = df_ing["multa_credito"].sum()     if "multa_credito"  in df_ing.columns else 0
+        total_multa_neto     = df_ing["multa_neto"].sum()        if "multa_neto"     in df_ing.columns else 0
+
+        total_hoj_cargo      = df_ing["hojalatero_cargo"].sum()   if "hojalatero_cargo"   in df_ing.columns else 0
+        total_hoj_cred       = df_ing["hojalatero_credito"].sum() if "hojalatero_credito" in df_ing.columns else 0
+        total_hoj_neto       = df_ing["hojalatero_neto"].sum()    if "hojalatero_neto"    in df_ing.columns else 0
+
+        total_desc_cargo     = df_ing["descuentos_cargo"].sum()   if "descuentos_cargo"   in df_ing.columns else 0
+        total_desc_cred      = df_ing["descuentos_credito"].sum() if "descuentos_credito" in df_ing.columns else 0
+        total_desc_neto      = df_ing["descuentos_neto"].sum()    if "descuentos_neto"    in df_ing.columns else 0
+
+        # Fila 1: KPIs principales
+        k1, k2, k3 = st.columns(3)
+        k1.metric("Renta Total",       f"${total_renta:,.0f}")
+        k2.metric("Fianza Neta",       f"${total_fianza:,.0f}")
+        k3.metric("Ganancias Totales", f"${total_ganancias:,.0f}")
+
+        # Fila 2: KPIs neto (cargos - créditos)
+        k4, k5, k6 = st.columns(3)
+        k4.metric(
+            "Multas Netas",
+            f"${total_multa_neto:,.0f}",
+            delta=f"Cargos ${total_multa_cargo:,.0f} · Créditos ${total_multa_cred:,.0f}",
+            delta_color="off",
+            help="Neto = Cargos cobrados − Créditos/devoluciones. Usa la columna multa_neto.",
+        )
+        k5.metric(
+            "Hojalatero Neto",
+            f"${total_hoj_neto:,.0f}",
+            delta=f"Cargos ${total_hoj_cargo:,.0f} · Créditos ${total_hoj_cred:,.0f}",
+            delta_color="off",
+            help="Neto = Cargos − Créditos. Usa hojalatero_neto.",
+        )
+        k6.metric(
+            "Descuentos Netos",
+            f"${total_desc_neto:,.0f}",
+            delta=f"Cargos ${total_desc_cargo:,.0f} · Créditos ${total_desc_cred:,.0f}",
+            delta_color="off",
+            help="Neto = Cargos − Créditos. El más crítico: muchos créditos positivos en DESC.",
+        )
 
         st.divider()
 
@@ -610,8 +643,11 @@ with tab_ingresos:
         cols_show = [
             c for c in [
                 "año", "semana", "WEEK_LABEL", "conductor", "llave", "socio",
-                "app", "renta_semanal", "fianza", "multa", "hojalatero",
-                "descuentos", "ganancias_totales", "concepto_ingreso",
+                "app", "renta_semanal", "fianza",
+                "multa_cargo", "multa_credito", "multa_neto",
+                "hojalatero_cargo", "hojalatero_credito", "hojalatero_neto",
+                "descuentos_cargo", "descuentos_credito", "descuentos_neto",
+                "ganancias_totales", "concepto_ingreso",
             ] if c in df_ing.columns
         ]
         st.dataframe(
@@ -620,14 +656,57 @@ with tab_ingresos:
             hide_index=True,
             height=400,
             column_config={
-                "renta_semanal": st.column_config.NumberColumn("Renta", format="$%,.0f"),
-                "fianza": st.column_config.NumberColumn("Fianza", format="$%,.0f"),
-                "multa": st.column_config.NumberColumn("Multa", format="$%,.0f"),
-                "hojalatero": st.column_config.NumberColumn("Hojalatero", format="$%,.0f"),
-                "descuentos": st.column_config.NumberColumn("Descuentos", format="$%,.0f"),
-                "ganancias_totales": st.column_config.NumberColumn("Gan. Totales", format="$%,.0f"),
+                "renta_semanal":      st.column_config.NumberColumn("Renta",      format="$%,.0f"),
+                "fianza":             st.column_config.NumberColumn("Fianza",     format="$%,.0f"),
+                "multa_cargo":        st.column_config.NumberColumn("Multa Cargo",   format="$%,.0f"),
+                "multa_credito":      st.column_config.NumberColumn("Multa Créd.",   format="$%,.0f"),
+                "multa_neto":         st.column_config.NumberColumn("Multa Neto",    format="$%,.0f"),
+                "hojalatero_cargo":   st.column_config.NumberColumn("Hoj. Cargo",    format="$%,.0f"),
+                "hojalatero_credito": st.column_config.NumberColumn("Hoj. Créd.",    format="$%,.0f"),
+                "hojalatero_neto":    st.column_config.NumberColumn("Hoj. Neto",     format="$%,.0f"),
+                "descuentos_cargo":   st.column_config.NumberColumn("Desc. Cargo",   format="$%,.0f"),
+                "descuentos_credito": st.column_config.NumberColumn("Desc. Créd.",   format="$%,.0f"),
+                "descuentos_neto":    st.column_config.NumberColumn("Desc. Neto",    format="$%,.0f"),
+                "ganancias_totales":  st.column_config.NumberColumn("Gan. Totales",  format="$%,.0f"),
             },
         )
+
+        # ── SECCIÓN: AUDITORÍA DE SIGNOS Y CONCEPTOS ─────────────────────
+        st.divider()
+        st.markdown("#### 🔍 Auditoría de Signos y Conceptos")
+        st.caption(
+            "Esta tabla permite validar cada KPI contra el Excel. "
+            "**Suma Abs** es lo que mostraba el dashboard anterior (con `.abs()`). "
+            "**Neto** es el valor correcto (cargos − créditos)."
+        )
+
+        aud_df = auditoria_signos(df_ing)
+        if not aud_df.empty:
+            st.dataframe(
+                aud_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Concepto":        st.column_config.TextColumn("Concepto"),
+                    "Suma Abs":        st.column_config.NumberColumn("Suma Abs (anterior)", format="$%,.2f"),
+                    "Cargos (neg)":    st.column_config.NumberColumn("Cargos",   format="$%,.2f"),
+                    "Creditos (pos)":  st.column_config.NumberColumn("Créditos", format="$%,.2f"),
+                    "Neto":            st.column_config.NumberColumn("Neto ✓",   format="$%,.2f"),
+                    "Filas negativas": st.column_config.NumberColumn("Filas neg"),
+                    "Filas positivas": st.column_config.NumberColumn("Filas pos"),
+                    "Filas nulas":     st.column_config.NumberColumn("Nulas"),
+                },
+            )
+            # Resaltar diferencia más crítica (DESC)
+            if len(aud_df) > 0:
+                desc_row = aud_df[aud_df["Concepto"] == "Descuentos"]
+                if not desc_row.empty:
+                    inflacion = float(desc_row["Suma Abs"].iloc[0]) - float(desc_row["Neto"].iloc[0])
+                    if inflacion > 0:
+                        st.warning(
+                            f"⚠️ **Descuentos**: el método anterior (abs) sobreestimaba en **${inflacion:,.2f}** "
+                            f"({float(desc_row['Creditos (pos)'].iloc[0]):,.2f} de créditos contados como cargos)."
+                        )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1051,8 +1130,9 @@ with tab_vehiculos:
                 .agg(
                     Renta=("renta_semanal", "sum"),
                     Fianza=("fianza", "sum"),
-                    Multas=("multa", "sum"),
-                    Hojalatero=("hojalatero", "sum"),
+                    Multas=("multa_neto", "sum"),
+                    Hojalatero=("hojalatero_neto", "sum"),
+                    Descuentos=("descuentos_neto", "sum"),
                     Ganancias=("ganancias_totales", "sum"),
                     Semanas=("semana", "nunique"),
                 )
@@ -1071,21 +1151,22 @@ with tab_vehiculos:
                 kpi_v["Utilidad"] = kpi_v["Ganancias"] - kpi_v["Egresos"]
 
             # ── KPI CARDS para vehículo(s) seleccionado(s) ──────────
-            sel_renta = kpi_v["Renta"].sum()
-            sel_fianza = kpi_v["Fianza"].sum()
-            sel_multas = kpi_v["Multas"].sum()
-            sel_hojalatero = kpi_v["Hojalatero"].sum()
-            sel_ganancias = kpi_v["Ganancias"].sum()
-            sel_semanas = kpi_v["Semanas"].sum()
-            sel_egresos = kpi_v["Egresos"].sum() if "Egresos" in kpi_v.columns else 0
-            sel_utilidad = kpi_v["Utilidad"].sum() if "Utilidad" in kpi_v.columns else sel_ganancias
+            sel_renta       = kpi_v["Renta"].sum()
+            sel_fianza      = kpi_v["Fianza"].sum()
+            sel_multas      = kpi_v["Multas"].sum()
+            sel_hojalatero  = kpi_v["Hojalatero"].sum()
+            sel_descuentos  = kpi_v["Descuentos"].sum() if "Descuentos" in kpi_v.columns else 0
+            sel_ganancias   = kpi_v["Ganancias"].sum()
+            sel_semanas     = kpi_v["Semanas"].sum()
+            sel_egresos     = kpi_v["Egresos"].sum() if "Egresos" in kpi_v.columns else 0
+            sel_utilidad    = kpi_v["Utilidad"].sum() if "Utilidad" in kpi_v.columns else sel_ganancias
 
             st.markdown(f"#### 📊 KPIs — {', '.join(llave_sel[:3])}{'…' if len(llave_sel) > 3 else ''}")
 
             v1, v2, v3, v4 = st.columns(4)
-            v1.metric("💰 Renta Total", f"${sel_renta:,.0f}")
+            v1.metric("💰 Renta Total",      f"${sel_renta:,.0f}")
             v2.metric("📈 Ganancias Totales", f"${sel_ganancias:,.0f}")
-            v3.metric("💸 Gasto Operativo", f"${sel_egresos:,.0f}", help="Sin Inversión")
+            v3.metric("💸 Gasto Operativo",   f"${sel_egresos:,.0f}", help="Sin Inversión")
             v4.metric(
                 "📊 Utilidad Operativa",
                 f"${sel_utilidad:,.0f}",
@@ -1093,10 +1174,10 @@ with tab_vehiculos:
             )
 
             v5, v6, v7, v8 = st.columns(4)
-            v5.metric("🔒 Fianza Neta", f"${sel_fianza:,.0f}")
-            v6.metric("🚨 Multas", f"${sel_multas:,.0f}")
-            v7.metric("🔧 Hojalatero", f"${sel_hojalatero:,.0f}")
-            v8.metric("📅 Semanas Activas", f"{sel_semanas}")
+            v5.metric("🔒 Fianza Neta",    f"${sel_fianza:,.0f}")
+            v6.metric("🚨 Multas Netas",   f"${sel_multas:,.0f}",     help="Cargos − Créditos")
+            v7.metric("🔧 Hojalatero Neto",f"${sel_hojalatero:,.0f}", help="Cargos − Créditos")
+            v8.metric("🏷️ Desc. Netos",    f"${sel_descuentos:,.0f}", help="Cargos − Créditos")
 
             st.divider()
 
@@ -1174,8 +1255,11 @@ with tab_vehiculos:
             cols_v = [
                 c for c in [
                     "año", "semana", "WEEK_LABEL", "conductor", "llave",
-                    "renta_semanal", "fianza", "multa", "hojalatero",
-                    "descuentos", "ganancias_totales", "concepto_ingreso",
+                    "renta_semanal", "fianza",
+                    "multa_cargo", "multa_credito", "multa_neto",
+                    "hojalatero_cargo", "hojalatero_credito", "hojalatero_neto",
+                    "descuentos_cargo", "descuentos_credito", "descuentos_neto",
+                    "ganancias_totales", "concepto_ingreso",
                 ] if c in df_v.columns
             ]
             st.dataframe(
@@ -1184,12 +1268,18 @@ with tab_vehiculos:
                 hide_index=True,
                 height=400,
                 column_config={
-                    "renta_semanal": st.column_config.NumberColumn("Renta", format="$%,.0f"),
-                    "fianza": st.column_config.NumberColumn("Fianza", format="$%,.0f"),
-                    "multa": st.column_config.NumberColumn("Multa", format="$%,.0f"),
-                    "hojalatero": st.column_config.NumberColumn("Hojalatero", format="$%,.0f"),
-                    "descuentos": st.column_config.NumberColumn("Descuentos", format="$%,.0f"),
-                    "ganancias_totales": st.column_config.NumberColumn("Gan. Totales", format="$%,.0f"),
+                    "renta_semanal":      st.column_config.NumberColumn("Renta",        format="$%,.0f"),
+                    "fianza":             st.column_config.NumberColumn("Fianza",       format="$%,.0f"),
+                    "multa_cargo":        st.column_config.NumberColumn("Multa Cargo",  format="$%,.0f"),
+                    "multa_credito":      st.column_config.NumberColumn("Multa Créd.",  format="$%,.0f"),
+                    "multa_neto":         st.column_config.NumberColumn("Multa Neto",   format="$%,.0f"),
+                    "hojalatero_cargo":   st.column_config.NumberColumn("Hoj. Cargo",   format="$%,.0f"),
+                    "hojalatero_credito": st.column_config.NumberColumn("Hoj. Créd.",   format="$%,.0f"),
+                    "hojalatero_neto":    st.column_config.NumberColumn("Hoj. Neto",    format="$%,.0f"),
+                    "descuentos_cargo":   st.column_config.NumberColumn("Desc. Cargo",  format="$%,.0f"),
+                    "descuentos_credito": st.column_config.NumberColumn("Desc. Créd.",  format="$%,.0f"),
+                    "descuentos_neto":    st.column_config.NumberColumn("Desc. Neto",   format="$%,.0f"),
+                    "ganancias_totales":  st.column_config.NumberColumn("Gan. Totales", format="$%,.0f"),
                 },
             )
 

@@ -1,10 +1,19 @@
 # business_rules.py
 # ──────────────────────────────────────────────────────────────
 # Módulo de reglas de negocio — Operación UBER 2025 / 2026
-# Lee prueba.xlsx (4 hojas) y expone DataFrames limpios.
+# ──────────────────────────────────────────────────────────────
+# REGLAS DE SIGNO (documentadas aquí para auditoria):
+#   RENTA      : valores negativos en Excel → cobro al conductor → abs()
+#   FIANZA     : negativo en Excel = ingreso (cobro), positivo = devolución.
+#                Se invierte para que positivo = cobrado, negativo = devuelto.
+#   MULTA      : negativo = cargo al conductor; positivo = crédito/devolución.
+#                NO se usa abs(). Se expone cargo, credito y neto.
+#   HOJALATERO : igual que MULTA.
+#   DESCUENTOS : igual que MULTA. Es el más crítico: muchos créditos positivos.
 # ──────────────────────────────────────────────────────────────
 from __future__ import annotations
 
+import warnings
 import numpy as np
 import pandas as pd
 
@@ -13,7 +22,7 @@ import pandas as pd
 # ═══════════════════════════════════════════════════════════════
 SHEETS = {
     "ingresos": {
-        2025: {"name": "UBER 2025", "header_row": 0},   # fila 0 = encabezados reales
+        2025: {"name": "UBER 2025", "header_row": 0},
         2026: {"name": "UBER 2026", "header_row": 0},
     },
     "egresos": {
@@ -23,55 +32,37 @@ SHEETS = {
 }
 
 # ═══════════════════════════════════════════════════════════════
-# MAPEO DE COLUMNAS — INGRESOS  (UBER 2025 / 2026)
+# ALIASES DE COLUMNAS — robusto ante variaciones entre años
 # ═══════════════════════════════════════════════════════════════
-# Nombres canónicos → nombres reales por año
-_INGRESOS_RENAME = {
-    2025: {
-        # ── Columnas reales en UBER 2025 (header_row=0) ──────────────────
-        "SEM":             "semana",
-        "CONDUCTOR":       "conductor",
-        "AUTO":            "llave",        # 2025 usa AUTO, 2026 usa LLAVE
-        "TAG":             "tag",
-        "SOCIO":           "socio",
-        "PLATAFORMA":      "plataforma",
-        "APP":             "app",
-        "GANANCIA":        "ganancia",
-        "RENTA":           "renta_raw",
-        "SEM PASADA":      "sem_pasada",
-        "FIANZA":          "fianza_raw",
-        "MULTA":           "multa_raw",
-        "HOJALATERO":      "hojalatero_raw",   # Excel 2025 tiene nombre largo
-        "DESCUENTOS":      "descuentos_raw",
-        "TOTAL":           "total",
-        "GANANCIAS TOTALES": "ganancias_totales",
-        "COMENTARIOS":     "comentarios",
-    },
-    2026: {
-        # ── Columnas reales en UBER 2026 (header_row=0) ──────────────────
-        "SEM":       "semana",
-        "CONDUCTOR": "conductor",
-        "LLAVE":     "llave",            # 2026 usa LLAVE, 2025 usa AUTO
-        "TAG":       "tag",
-        "SOCIO":     "socio",
-        "PLATAFORMA":"plataforma",
-        "APP":       "app",
-        "GANANCIA":  "ganancia",
-        "RENTA":     "renta_raw",
-        "SEM A":     "sem_pasada",       # ← era "SEM PASADA", ahora abreviado
-        "FIANZA":    "fianza_raw",
-        "MULTA":     "multa_raw",
-        "HOJALAT":   "hojalatero_raw",   # ← era "HOJALATERO", ahora abreviado
-        "DESC":      "descuentos_raw",   # ← era "DESCUENTOS", ahora abreviado
-        "TOTAL":     "total",
-        "GANAN T":   "ganancias_totales", # ← era "GANANCIAS \nTOTALES"
-        "COMENTARIOS": "comentarios",
-    },
+# Clave = nombre canónico interno; valor = lista de aliases en el Excel
+# (se usa el primer alias que se encuentre en cada hoja)
+COLUMN_ALIASES: dict[str, list[str]] = {
+    "semana":             ["SEM"],
+    "conductor":          ["CONDUCTOR"],
+    "llave":              ["LLAVE", "AUTO"],
+    "tag":                ["TAG"],
+    "socio":              ["SOCIO"],
+    "plataforma":         ["PLATAFORMA"],
+    "app":                ["APP"],
+    "ganancia":           ["GANANCIA"],
+    "renta_raw":          ["RENTA"],
+    "sem_pasada":         ["SEM A", "SEM PASADA"],
+    "fianza_raw":         ["FIANZA"],
+    "multa_raw":          ["MULTA"],
+    "hojalatero_raw":     ["HOJALAT", "HOJALATERO"],
+    "descuentos_raw":     ["DESC", "DESCUENTOS"],
+    "total":              ["TOTAL"],
+    "ganancias_totales":  ["GANAN T", "GANANCIAS TOTALES", "GANANCIAS \nTOTALES"],
+    "comentarios":        ["COMENTARIOS"],
 }
 
-# ═══════════════════════════════════════════════════════════════
-# MAPEO DE COLUMNAS — EGRESOS  (Gastos 2025 / 2026)
-# ═══════════════════════════════════════════════════════════════
+# Columnas numéricas que siempre se convierten
+_INGRESOS_NUMERIC = [
+    "ganancia", "renta_raw", "sem_pasada", "fianza_raw",
+    "multa_raw", "hojalatero_raw", "descuentos_raw",
+    "total", "ganancias_totales",
+]
+
 _EGRESOS_RENAME = {
     2025: {
         "Semana": "semana",
@@ -81,7 +72,7 @@ _EGRESOS_RENAME = {
         "CONCEPTO": "concepto",
         "DETALLE": "detalle",
         "CONDUCTOR": "conductor",
-        "DETALLE.1": "llave",            # 2025 usa segunda col DETALLE como llave
+        "DETALLE.1": "llave",
         "SOCIO": "socio",
         "METODO DE PAGO": "metodo_pago",
         "REAL": "monto_real",
@@ -108,13 +99,6 @@ _EGRESOS_RENAME = {
     },
 }
 
-# Columnas numéricas que siempre se convierten
-_INGRESOS_NUMERIC = [
-    "ganancia", "renta_raw", "sem_pasada", "fianza_raw",
-    "multa_raw", "hojalatero_raw", "descuentos_raw",
-    "total", "ganancias_totales",
-]
-
 _EGRESOS_NUMERIC = ["monto_real"]
 
 
@@ -122,17 +106,12 @@ _EGRESOS_NUMERIC = ["monto_real"]
 # HELPERS
 # ═══════════════════════════════════════════════════════════════
 def _to_semana(s: pd.Series) -> pd.Series:
-    """Convierte la columna de semana a float64 (compatible con NaN y PyArrow).
-
-    Se usa float64 en lugar de Int64 nullable de pandas porque este último
-    no es reconocido por PyArrow (motor de serialización de Streamlit) en
-    ciertas versiones, causando el error: data type 'Int64' not understood.
-    """
-    return pd.to_numeric(s, errors="coerce")  # devuelve float64 con NaN donde no parsea
+    """Convierte semana a float64 (NaN-safe, compatible PyArrow)."""
+    return pd.to_numeric(s, errors="coerce")
 
 
 def _coerce_numeric(s: pd.Series) -> pd.Series:
-    """Convierte a numérico aceptando $, comas, paréntesis (negativos)."""
+    """Convierte a numérico: acepta $, comas, paréntesis (negativos)."""
     if s is None or pd.api.types.is_numeric_dtype(s):
         return s
     x = s.astype(str).str.strip()
@@ -146,9 +125,7 @@ def _coerce_numeric(s: pd.Series) -> pd.Series:
         val = str(val)
         if "," not in val:
             return val
-        if "." in val:
-            return val.replace(",", "")
-        return val.replace(",", ".")
+        return val.replace(",", "") if "." in val else val.replace(",", ".")
 
     x = x.apply(_fix_commas)
     return pd.to_numeric(x, errors="coerce")
@@ -158,13 +135,61 @@ def _strip_unnamed(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[:, ~df.columns.astype(str).str.match(r"^Unnamed")]
 
 
+def _resolve_aliases(raw_cols: list[str], aliases: dict[str, list[str]]) -> dict[str, str]:
+    """
+    Dado el listado real de columnas del Excel y el diccionario de aliases,
+    devuelve {excel_col -> canonical_name} para las columnas encontradas.
+    Emite warning si un alias canónico no se encuentra.
+    """
+    rename_map: dict[str, str] = {}
+    for canonical, candidates in aliases.items():
+        for candidate in candidates:
+            if candidate in raw_cols:
+                rename_map[candidate] = canonical
+                break
+        else:
+            # Ningún alias encontrado — warning suave
+            if canonical in _INGRESOS_NUMERIC or canonical in ("semana", "conductor"):
+                warnings.warn(
+                    f"[business_rules] Columna '{canonical}' no encontrada. "
+                    f"Aliases buscados: {candidates}",
+                    UserWarning,
+                    stacklevel=3,
+                )
+    return rename_map
+
+
+# ═══════════════════════════════════════════════════════════════
+# LÓGICA DE SIGNOS — COLUMNAS CON SIGNO MIXTO
+# ═══════════════════════════════════════════════════════════════
+def split_cargos_creditos(s: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """
+    Descompone una Serie con signo mixto en tres métricas:
+
+    Interpretación del Excel:
+      - Valor negativo → cargo/cobro al conductor  → aparece como positivo en 'cargo'
+      - Valor positivo → crédito/devolución        → aparece tal cual en 'credito'
+      - Neto = cargo - credito  (lo que realmente se cobró neto)
+
+    Returns
+    -------
+    (cargo, credito, neto) — tres Series con el mismo índice que s.
+    """
+    valores = s.fillna(0)
+    cargo   = valores.where(valores < 0, 0).abs()   # neg -> positivo
+    credito = valores.where(valores > 0, 0)          # pos -> tal cual
+    neto    = cargo - credito
+    return cargo, credito, neto
+
+
 # ═══════════════════════════════════════════════════════════════
 # TRANSFORMACIONES — INGRESOS
 # ═══════════════════════════════════════════════════════════════
 def _invertir_signo_fianza(val):
-    """Regla: en el Excel '-' representa ingreso de dinero,
-    '+' es devolución al conductor.  Invertimos para que
-    positivo = ingreso, negativo = devolución."""
+    """
+    Regla fianza: en el Excel '-' es cobro de fianza al conductor (ingreso),
+    '+' es devolución. Invertimos para que positivo = cobrado.
+    """
     if pd.isna(val):
         return 0.0
     return float(val) * -1
@@ -177,45 +202,126 @@ def generar_concepto_ingreso(row: pd.Series) -> str:
         partes.append("Renta")
     if (row.get("fianza", 0) or 0) != 0:
         partes.append("Fianza")
-    if abs(row.get("multa", 0) or 0) > 0:
+    if abs(row.get("multa_neto", 0) or 0) > 0:
         partes.append("Multa")
-    if abs(row.get("hojalatero", 0) or 0) > 0:
+    if abs(row.get("hojalatero_neto", 0) or 0) > 0:
         partes.append("Hojalatero")
-    if abs(row.get("descuentos", 0) or 0) > 0:
+    if abs(row.get("descuentos_neto", 0) or 0) > 0:
         partes.append("Descuento")
     return " + ".join(partes) if partes else "Sin concepto"
 
 
 def transform_ingresos(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica reglas de negocio a un DataFrame de ingresos ya renombrado."""
+    """
+    Aplica reglas de negocio a un DataFrame de ingresos ya renombrado.
+
+    Columnas generadas por concepto con signo mixto (multa/hojalatero/descuentos):
+      *_cargo   : suma de valores negativos convertidos a positivo (cobros reales)
+      *_credito : suma de valores positivos (devoluciones/ajustes a favor)
+      *_neto    : cargo - credito (lo que realmente impacta al conductor)
+
+    Los KPIs del dashboard deben usar *_neto para no inflar los totales.
+    """
     out = df.copy()
 
-    # Valor absoluto: renta, multa, hojalatero, descuentos
+    # ── Renta: siempre negativa en Excel → abs() es correcto ──────────
     out["renta_semanal"] = out["renta_raw"].fillna(0).abs()
-    out["multa"]         = out["multa_raw"].fillna(0).abs()
-    out["hojalatero"]    = out["hojalatero_raw"].fillna(0).abs()
-    out["descuentos"]    = out["descuentos_raw"].fillna(0).abs()
 
-    # Fianza: invertir signo
+    # ── Fianza: invertir signo (neg=cobro, pos=devolución) ─────────────
     out["fianza"] = out["fianza_raw"].apply(_invertir_signo_fianza)
 
-    # Concepto auto-generado
+    # Desglose fianza para auditoría
+    _fc, _fd, _fn = split_cargos_creditos(out["fianza_raw"])
+    out["fianza_cobrada"]  = _fc   # cuánto se cobró al conductor
+    out["fianza_devuelta"] = _fd   # cuánto se devolvió
+    out["fianza_neta"]     = _fn   # cobrado - devuelto
+
+    # ── Multa: signo mixto → NO usar abs() ────────────────────────────
+    _mc, _mcr, _mn = split_cargos_creditos(out["multa_raw"])
+    out["multa_cargo"]   = _mc    # cargos cobrados al conductor
+    out["multa_credito"] = _mcr   # créditos/devoluciones
+    out["multa_neto"]    = _mn    # neto real
+    # Alias de compatibilidad (apunta al neto, no al abs)
+    out["multa"]         = _mn
+
+    # ── Hojalatero: signo mixto → NO usar abs() ───────────────────────
+    _hc, _hcr, _hn = split_cargos_creditos(out["hojalatero_raw"])
+    out["hojalatero_cargo"]   = _hc
+    out["hojalatero_credito"] = _hcr
+    out["hojalatero_neto"]    = _hn
+    out["hojalatero"]         = _hn
+
+    # ── Descuentos: signo mixto → el más crítico (muchos créditos) ────
+    _dc, _dcr, _dn = split_cargos_creditos(out["descuentos_raw"])
+    out["descuentos_cargo"]   = _dc
+    out["descuentos_credito"] = _dcr
+    out["descuentos_neto"]    = _dn
+    out["descuentos"]         = _dn
+
+    # ── Concepto auto-generado ─────────────────────────────────────────
     out["concepto_ingreso"] = out.apply(generar_concepto_ingreso, axis=1)
 
-    # Limpiar columnas raw
-    out.drop(columns=[
-        "renta_raw", "multa_raw", "hojalatero_raw",
-        "descuentos_raw", "fianza_raw",
-    ], inplace=True)
-
+    # Mantener columnas raw para auditoría (no se eliminan)
     return out
+
+
+# ═══════════════════════════════════════════════════════════════
+# TABLA DE AUDITORÍA DE SIGNOS
+# ═══════════════════════════════════════════════════════════════
+def auditoria_signos(df_ing: pd.DataFrame) -> pd.DataFrame:
+    """
+    Genera tabla resumen para comparar el dashboard contra el Excel.
+
+    Columnas:
+      Concepto | Suma Abs | Cargos (neg) | Creditos (pos) | Neto | Filas neg | Filas pos | Filas nulas
+    """
+    CONCEPTOS = [
+        ("Renta",       "renta_raw",       None,               None,               None),
+        ("Fianza",      "fianza_raw",       "fianza_cobrada",   "fianza_devuelta",  "fianza_neta"),
+        ("Multa",       "multa_raw",        "multa_cargo",      "multa_credito",    "multa_neto"),
+        ("Hojalatero",  "hojalatero_raw",   "hojalatero_cargo", "hojalatero_credito", "hojalatero_neto"),
+        ("Descuentos",  "descuentos_raw",   "descuentos_cargo", "descuentos_credito", "descuentos_neto"),
+    ]
+
+    filas = []
+    for nombre, col_raw, col_cargo, col_cred, col_neto in CONCEPTOS:
+        if col_raw not in df_ing.columns:
+            continue
+        s = df_ing[col_raw].fillna(0)
+        negs  = (s < 0).sum()
+        poss  = (s > 0).sum()
+        nulas = df_ing[col_raw].isna().sum()
+
+        suma_abs = s.abs().sum()
+
+        if col_cargo and col_cargo in df_ing.columns:
+            cargo  = df_ing[col_cargo].sum()
+            cred   = df_ing[col_cred].sum()
+            neto   = df_ing[col_neto].sum()
+        else:
+            # Renta: siempre negativa, abs() es correcto
+            cargo  = s.abs().sum()
+            cred   = 0.0
+            neto   = cargo
+
+        filas.append({
+            "Concepto":        nombre,
+            "Suma Abs":        suma_abs,
+            "Cargos (neg)":    cargo,
+            "Creditos (pos)":  cred,
+            "Neto":            neto,
+            "Filas negativas": negs,
+            "Filas positivas": poss,
+            "Filas nulas":     nulas,
+        })
+
+    return pd.DataFrame(filas)
 
 
 # ═══════════════════════════════════════════════════════════════
 # TRANSFORMACIONES — EGRESOS
 # ═══════════════════════════════════════════════════════════════
 def transform_egresos(df: pd.DataFrame) -> pd.DataFrame:
-    """Aplica reglas de negocio a un DataFrame de egresos ya renombrado."""
     out = df.copy()
     out["monto_real"] = out["monto_real"].fillna(0).abs()
     return out
@@ -228,7 +334,7 @@ def load_ingresos(
     path: str = "prueba.xlsx",
     años: list[int] | None = None,
 ) -> pd.DataFrame:
-    """Lee hojas UBER 2025 / 2026 y devuelve DataFrame unificado y transformado."""
+    """Lee hojas UBER 2025/2026 y devuelve DataFrame unificado y transformado."""
     if años is None:
         años = [2025, 2026]
 
@@ -245,20 +351,19 @@ def load_ingresos(
         raw = _strip_unnamed(raw)
         raw.columns = [str(c).strip() for c in raw.columns]
 
-        rename = _INGRESOS_RENAME.get(año, {})
-        # Solo renombrar columnas que existen
-        rename_valid = {k: v for k, v in rename.items() if k in raw.columns}
-        df = raw.rename(columns=rename_valid)
+        # Resolver aliases de columnas de forma robusta
+        rename_map = _resolve_aliases(list(raw.columns), COLUMN_ALIASES)
+        df = raw.rename(columns=rename_map)
 
         # Coerción numérica
         for col in _INGRESOS_NUMERIC:
             if col in df.columns:
                 df[col] = _coerce_numeric(df[col])
 
-        df["semana"] = _to_semana(df.get("semana"))  # float64, acepta NaN, compatible PyArrow
+        df["semana"] = _to_semana(df.get("semana"))
         df["año"] = año
 
-        # Filtrar filas sin semana (encabezados, totales)
+        # Filtrar filas sin semana válida (totales, encabezados, etc.)
         df = df.dropna(subset=["semana"])
 
         frames.append(df)
@@ -274,7 +379,7 @@ def load_egresos(
     path: str = "prueba.xlsx",
     años: list[int] | None = None,
 ) -> pd.DataFrame:
-    """Lee hojas Gastos 2025 / 2026 y devuelve DataFrame unificado y transformado."""
+    """Lee hojas Gastos 2025/2026 y devuelve DataFrame unificado y transformado."""
     if años is None:
         años = [2025, 2026]
 
@@ -299,11 +404,9 @@ def load_egresos(
             if col in df.columns:
                 df[col] = _coerce_numeric(df[col])
 
-        df["semana"] = _to_semana(df.get("semana"))  # float64, acepta NaN, compatible PyArrow
+        df["semana"] = _to_semana(df.get("semana"))
         df["año"] = año
-
         df = df.dropna(subset=["semana"])
-
         frames.append(df)
 
     if not frames:
@@ -317,7 +420,6 @@ def load_egresos(
 # UTILIDADES PARA DASHBOARD
 # ═══════════════════════════════════════════════════════════════
 def yearweek_key(año, semana) -> int:
-    """Crea un entero AÑO*100 + SEM para ordenar."""
     return int(año) * 100 + int(semana)
 
 
@@ -328,17 +430,14 @@ def yearweek_label(key: int) -> str:
 
 
 def add_yearweek(df: pd.DataFrame) -> pd.DataFrame:
-    """Agrega columnas YEARWEEK y WEEK_LABEL para agrupar por semana."""
     out = df.copy()
-    # Usamos float64 para evitar el nullable Int64 de pandas, incompatible con PyArrow.
-    # Las filas sin semana válida quedarán como NaN y se filtran en el dashboard.
-    año_f   = pd.to_numeric(out["año"],    errors="coerce")  # float64
-    semana_f = pd.to_numeric(out["semana"], errors="coerce")  # float64
-    out["YEARWEEK"] = año_f * 100 + semana_f                 # float64, NaN-safe
+    año_f    = pd.to_numeric(out["año"],    errors="coerce")
+    semana_f = pd.to_numeric(out["semana"], errors="coerce")
+    out["YEARWEEK"]   = año_f * 100 + semana_f
     out["WEEK_LABEL"] = (
         out["YEARWEEK"]
         .dropna()
-        .astype(int)          # solo para construir la etiqueta string
+        .astype(int)
         .map(yearweek_label)
     )
     return out
@@ -348,26 +447,16 @@ def add_yearweek(df: pd.DataFrame) -> pd.DataFrame:
 # CONSTANTES DE INVERSIÓN
 # ═══════════════════════════════════════════════════════════════
 CONCEPTO_SUBASTA = "PAGO DE SUBASTA"
-PAGO_SEMANAL_DEFAULT = 2_500.0  # MXN por semana
+PAGO_SEMANAL_DEFAULT = 2_500.0
 
-# Conceptos que se clasifican como INVERSIÓN (no gasto operativo).
-# Case-insensitive. Si detectas variantes en el Excel, repórtalas.
 CONCEPTOS_INVERSION: list[str] = [
     "INVERSIÓN",
-    "INVERSION",   # sin acento, por si acaso
+    "INVERSION",
     "PAGO DE SUBASTA",
 ]
 
 
-# ═══════════════════════════════════════════════════════════════
-# UTILIDADES DE FILTRADO DE EGRESOS
-# ═══════════════════════════════════════════════════════════════
 def _mask_inversion(df: pd.DataFrame) -> pd.Series:
-    """Devuelve máscara booleana True donde el concepto es INVERSIÓN.
-
-    Compara en mayúsculas y sin espacios extra para ser robusto
-    ante variaciones de capitalización en el Excel.
-    """
     if "concepto" not in df.columns or df.empty:
         return pd.Series(False, index=df.index)
     conceptos_upper = [c.upper().strip() for c in CONCEPTOS_INVERSION]
@@ -381,73 +470,33 @@ def _mask_inversion(df: pd.DataFrame) -> pd.Series:
 
 
 def get_gastos(df_egresos: pd.DataFrame) -> pd.DataFrame:
-    """Filtra el DataFrame de egresos excluyendo conceptos de INVERSIÓN.
-
-    Usar esta función en todos los KPIs y gráficas de «gasto operativo»
-    para que la inversión no distorsione los totales.
-
-    Returns
-    -------
-    pd.DataFrame — egresos sin filas de inversión.
-    """
     if df_egresos.empty:
         return df_egresos.copy()
     return df_egresos[~_mask_inversion(df_egresos)].copy()
 
 
 def get_inversiones_egreso(df_egresos: pd.DataFrame) -> pd.DataFrame:
-    """Devuelve solo las filas de egresos clasificadas como INVERSIÓN.
-
-    Usar esta función para mostrar el KPI de inversión separado del gasto.
-
-    Returns
-    -------
-    pd.DataFrame — únicamente los egresos de tipo inversión.
-    """
     if df_egresos.empty:
         return df_egresos.copy()
     return df_egresos[_mask_inversion(df_egresos)].copy()
 
 
 def conductores_por_semana(df_ingresos: pd.DataFrame) -> pd.DataFrame:
-    """Cuenta conductores únicos por semana, eliminando duplicados.
-
-    Puede haber filas repetidas en el Excel (mismo conductor, misma semana).
-    Esta función deduplica por (año, semana, conductor) antes de contar,
-    evitando el sobreconteo.
-
-    Returns
-    -------
-    pd.DataFrame con columnas:
-        YEARWEEK       – clave numérica año*100+sem
-        WEEK_LABEL     – etiqueta «YYYY-SNN»
-        n_conductores  – número de conductores únicos esa semana
-    """
     if df_ingresos.empty:
-        return pd.DataFrame(
-            columns=["YEARWEEK", "WEEK_LABEL", "n_conductores"]
-        )
-
+        return pd.DataFrame(columns=["YEARWEEK", "WEEK_LABEL", "n_conductores"])
     required = {"año", "semana", "conductor"}
-    missing = required - set(df_ingresos.columns)
-    if missing:
-        return pd.DataFrame(
-            columns=["YEARWEEK", "WEEK_LABEL", "n_conductores"]
-        )
+    if required - set(df_ingresos.columns):
+        return pd.DataFrame(columns=["YEARWEEK", "WEEK_LABEL", "n_conductores"])
 
-    # Deduplicar: un conductor cuenta una sola vez por semana
     dedup = (
         df_ingresos
         .dropna(subset=["semana", "conductor"])
         .drop_duplicates(subset=["año", "semana", "conductor"])
     )
-
-    # Asegurarnos de tener YEARWEEK y WEEK_LABEL
     if "YEARWEEK" not in dedup.columns:
         dedup = add_yearweek(dedup)
 
-    # Contar conductores únicos por semana
-    result = (
+    return (
         dedup
         .groupby(["YEARWEEK", "WEEK_LABEL"], as_index=False)["conductor"]
         .nunique()
@@ -455,47 +504,22 @@ def conductores_por_semana(df_ingresos: pd.DataFrame) -> pd.DataFrame:
         .sort_values("YEARWEEK")
         .reset_index(drop=True)
     )
-    return result
 
 
 def calcular_amortizacion(
     capital: float,
     pago_semanal: float = PAGO_SEMANAL_DEFAULT,
 ) -> pd.DataFrame:
-    """Genera la tabla de amortización semanal para un capital dado.
-
-    Parameters
-    ----------
-    capital : float
-        Monto invertido (capital inicial).
-    pago_semanal : float
-        Pago fijo aplicado por semana contra el saldo.
-
-    Returns
-    -------
-    pd.DataFrame con columnas:
-        semana_num          – número de semana (1, 2, 3, …)
-        pago_recuperacion   – pago aplicado esa semana
-        saldo_restante      – saldo pendiente después del pago
-    """
     if capital <= 0 or pago_semanal <= 0:
-        return pd.DataFrame(
-            columns=["semana_num", "pago_recuperacion", "saldo_restante"]
-        )
-
+        return pd.DataFrame(columns=["semana_num", "pago_recuperacion", "saldo_restante"])
     filas = []
     saldo = float(capital)
     semana = 1
     while saldo > 0:
         pago = min(pago_semanal, saldo)
         saldo = round(saldo - pago, 2)
-        filas.append({
-            "semana_num": semana,
-            "pago_recuperacion": pago,
-            "saldo_restante": saldo,
-        })
+        filas.append({"semana_num": semana, "pago_recuperacion": pago, "saldo_restante": saldo})
         semana += 1
-
     return pd.DataFrame(filas)
 
 
@@ -504,29 +528,9 @@ def get_analisis_inversiones(
     df_ingresos: pd.DataFrame,
     pago_semanal: float = PAGO_SEMANAL_DEFAULT,
 ) -> dict:
-    """Analiza la recuperación de inversión para vehículos con PAGO DE SUBASTA.
-
-    Parameters
-    ----------
-    df_egresos : pd.DataFrame
-        DataFrame completo de egresos (post-transformación).
-    df_ingresos : pd.DataFrame
-        DataFrame completo de ingresos (post-transformación).
-    pago_semanal : float
-        Monto semanal destinado a recuperar la inversión (default $2,500).
-
-    Returns
-    -------
-    dict con dos claves:
-        "resumen"  → DataFrame con una fila por vehículo y métricas agregadas.
-        "tablas"   → dict { llave: DataFrame de amortización }.
-    """
-    import math
-
     resumen_filas = []
     tablas: dict[str, pd.DataFrame] = {}
 
-    # -- Detectar subastas --------------------------------------------------------
     if df_egresos.empty or "concepto" not in df_egresos.columns:
         return {"resumen": pd.DataFrame(), "tablas": {}}
 
@@ -535,59 +539,56 @@ def get_analisis_inversiones(
         == CONCEPTO_SUBASTA.upper()
     ].copy()
 
-    if subastas.empty:
-        return {"resumen": pd.DataFrame(), "tablas": {}}
-
-    if "llave" not in subastas.columns:
+    if subastas.empty or "llave" not in subastas.columns:
         return {"resumen": pd.DataFrame(), "tablas": {}}
 
     llaves_subasta = [
-        str(l) for l in subastas["llave"].dropna().unique() if str(l).strip() not in ("", "nan", "-")
+        str(l) for l in subastas["llave"].dropna().unique()
+        if str(l).strip() not in ("", "nan", "-")
     ]
 
     for llave in llaves_subasta:
-        # Capital total invertido en este vehículo
         mask_sub = subastas["llave"].astype(str) == llave
         capital = float(subastas.loc[mask_sub, "monto_real"].fillna(0).sum())
         if capital <= 0:
             continue
 
-        # Tabla de amortización
         tabla = calcular_amortizacion(capital, pago_semanal)
         tablas[llave] = tabla
 
         semanas_recuperacion = int(len(tabla))
         monto_recuperado = float(tabla["pago_recuperacion"].sum())
 
-        # Ingresos generados por el vehículo (ganancias_totales)
         ingresos_veh = 0.0
         if not df_ingresos.empty and "llave" in df_ingresos.columns:
             mask_ing = df_ingresos["llave"].astype(str) == llave
             col_ing = "ganancias_totales" if "ganancias_totales" in df_ingresos.columns else "renta_semanal"
             ingresos_veh = float(df_ingresos.loc[mask_ing, col_ing].fillna(0).sum())
 
-        # ROI: (ingresos_totales - capital_inicial) / capital_inicial * 100
         roi_pct = ((ingresos_veh - capital) / capital * 100) if capital > 0 else 0.0
 
-        # Número de semanas activas en ingresos
         semanas_activas = 0
         if not df_ingresos.empty and "llave" in df_ingresos.columns:
             mask_ing = df_ingresos["llave"].astype(str) == llave
             semanas_activas = int(df_ingresos.loc[mask_ing, "semana"].dropna().nunique())
 
         resumen_filas.append({
-            "llave": llave,
-            "capital_inicial": capital,
-            "pago_semanal": pago_semanal,
+            "llave":                llave,
+            "capital_inicial":      capital,
+            "pago_semanal":         pago_semanal,
             "semanas_recuperacion": semanas_recuperacion,
-            "monto_recuperado": monto_recuperado,
-            "ingresos_totales": ingresos_veh,
-            "semanas_activas": semanas_activas,
-            "roi_pct": round(roi_pct, 2),
-            "recuperado": monto_recuperado >= capital,
+            "monto_recuperado":     monto_recuperado,
+            "ingresos_totales":     ingresos_veh,
+            "semanas_activas":      semanas_activas,
+            "roi_pct":              round(roi_pct, 2),
+            "recuperado":           monto_recuperado >= capital,
         })
 
-    resumen = pd.DataFrame(resumen_filas).sort_values("capital_inicial", ascending=False).reset_index(drop=True)
+    resumen = (
+        pd.DataFrame(resumen_filas)
+        .sort_values("capital_inicial", ascending=False)
+        .reset_index(drop=True)
+    )
     return {"resumen": resumen, "tablas": tablas}
 
 
@@ -595,68 +596,37 @@ def get_analisis_inversiones(
 # EJECUCIÓN DIRECTA (prueba rápida)
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    import sys, io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
     print("=" * 60)
     print("Cargando prueba.xlsx ...")
     print("=" * 60)
 
     df_ing = load_ingresos()
-    print(f"\n✅ Ingresos: {len(df_ing)} filas")
-    print(f"   Columnas: {list(df_ing.columns)}")
-    print(f"   Años: {sorted(df_ing['año'].unique())}")
-    if len(df_ing) > 0:
-        print(f"   Renta semanal (ejemplo): {df_ing['renta_semanal'].head(3).tolist()}")
-        print(f"   Fianza (ejemplo):        {df_ing['fianza'].head(3).tolist()}")
-        print(f"   Conceptos:               {df_ing['concepto_ingreso'].value_counts().head(5).to_dict()}")
-        print(f"   Ganancias totales sum:    ${df_ing['ganancias_totales'].sum():,.2f}")
+    print(f"\n Ingresos: {len(df_ing)} filas, anios: {sorted(df_ing['anio'].unique()) if 'anio' in df_ing.columns else sorted(df_ing['año'].unique())}")
 
-    df_egr = load_egresos()
-    print(f"\n✅ Egresos: {len(df_egr)} filas")
-    print(f"   Columnas: {list(df_egr.columns)}")
-    print(f"   Años: {sorted(df_egr['año'].unique())}")
-    if len(df_egr) > 0:
-        print(f"   Monto real (ejemplo):     {df_egr['monto_real'].head(3).tolist()}")
-        print(f"   Gasto total sum (CON inv):${df_egr['monto_real'].sum():,.2f}")
-        if "concepto" in df_egr.columns:
-            print(f"   Top conceptos:            {df_egr['concepto'].value_counts().head(8).to_dict()}")
+    # Prueba de signos 2026
+    df26 = df_ing[df_ing["año"] == 2026]
+    print("\n--- VALIDACION SIGNOS 2026 ---")
+    for concepto, col_raw, col_cargo, col_cred, col_neto in [
+        ("Multa",      "multa_raw",       "multa_cargo",       "multa_credito",       "multa_neto"),
+        ("Hojalatero", "hojalatero_raw",  "hojalatero_cargo",  "hojalatero_credito",  "hojalatero_neto"),
+        ("Descuentos", "descuentos_raw",  "descuentos_cargo",  "descuentos_credito",  "descuentos_neto"),
+    ]:
+        if col_raw not in df26.columns:
+            print(f"  {concepto}: columna raw no encontrada")
+            continue
+        print(f"\n  {concepto}:")
+        print(f"    raw sum         : {df26[col_raw].sum():>12,.2f}")
+        print(f"    cargo (cargos)  : {df26[col_cargo].sum():>12,.2f}")
+        print(f"    credito         : {df26[col_cred].sum():>12,.2f}")
+        print(f"    neto (KPI nuevo): {df26[col_neto].sum():>12,.2f}")
+        print(f"    abs() (anterior): {df26[col_raw].fillna(0).abs().sum():>12,.2f}")
 
-    # ── Validación: separación inversión / gasto ──────────────────────────
-    print("\n" + "─" * 60)
-    print("VALIDACIÓN — Separación INVERSIÓN / GASTO OPERATIVO")
-    print("─" * 60)
-    df_gasto = get_gastos(df_egr)
-    df_inv   = get_inversiones_egreso(df_egr)
+    # Tabla de auditoria
+    print("\n--- TABLA DE AUDITORIA ---")
+    aud = auditoria_signos(df26)
+    print(aud.to_string(index=False))
 
-    total_egr_bruto = df_egr["monto_real"].sum()   if len(df_egr)   > 0 else 0.0
-    total_gasto_val = df_gasto["monto_real"].sum() if len(df_gasto) > 0 else 0.0
-    total_inv_val   = df_inv["monto_real"].sum()   if len(df_inv)   > 0 else 0.0
-
-    print(f"  Egresos TOTALES (con inversión):  ${total_egr_bruto:>12,.2f}")
-    print(f"  Gasto OPERATIVO  (sin inversión): ${total_gasto_val:>12,.2f}")
-    print(f"  INVERSIÓN separada:               ${total_inv_val:>12,.2f}")
-    cuadre_ok = abs((total_gasto_val + total_inv_val) - total_egr_bruto) < 0.01
-    print(f"  ✓ Cuadre (gasto + inv = total):   {'OK' if cuadre_ok else '⚠️ DIFERENCIA'}")
-
-    if len(df_inv) > 0 and "concepto" in df_inv.columns:
-        print(f"\n  Conceptos detectados como INVERSIÓN:")
-        for concepto, cnt in df_inv["concepto"].value_counts().items():
-            monto = df_inv.loc[df_inv["concepto"] == concepto, "monto_real"].sum()
-            print(f"    • {str(concepto):30s}  {cnt:3d} filas  ${monto:,.2f}")
-    else:
-        print("  (No se encontraron filas de inversión en el período)")
-
-    # ── Validación: conductores únicos por semana ─────────────────────────
-    print("\n" + "─" * 60)
-    print("VALIDACIÓN — Conductores únicos por semana")
-    print("─" * 60)
-    df_ing_yw = add_yearweek(df_ing) if "YEARWEEK" not in df_ing.columns else df_ing
-    cond_sem = conductores_por_semana(df_ing_yw)
-    if len(cond_sem) > 0:
-        print(f"  Semanas con datos: {len(cond_sem)}")
-        print(f"  Conductores únicos promedio/semana: {cond_sem['n_conductores'].mean():.1f}")
-        print(f"  Máx: {cond_sem['n_conductores'].max()}  Mín: {cond_sem['n_conductores'].min()}")
-        print(f"\n  Primeras filas:")
-        print(cond_sem.head(5).to_string(index=False))
-    else:
-        print("  (Sin datos de conductores)")
-
-    print("\n✅ Módulo business_rules.py OK")
+    print("\n business_rules.py OK")
